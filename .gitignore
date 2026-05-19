@@ -1,0 +1,5 @@
+.ipcache/
+.Xil/
+outputs/
+xcd.log
+model/stories15M.bin
