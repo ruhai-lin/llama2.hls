@@ -4,5 +4,4 @@ outputs/
 xcd.log
 model/stories15M.bin
 model/stories15M.pt
-model/stories15M_q8.bin
 analyzer_input/
