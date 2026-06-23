@@ -1,6 +1,6 @@
 #include "weight.hpp"
 
-namespace swan {
+namespace llama2 {
 
 // Implement for initializing the tensor from the file.
 // Template specialization for 1D tensor.
@@ -45,4 +45,4 @@ void LoadWeights(Weights& w, Tensor2dTok& tok_emb_table, std::ifstream& fs) {
   InitTensor(w.sin_table, fs);       // [kSeqLen, kSinCosTable]
 }
 
-} // namespace swan
+} // namespace llama2

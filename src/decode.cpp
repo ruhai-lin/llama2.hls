@@ -7,13 +7,29 @@
 #include "kernel_mul.cpp"
 #include "kernel_rmsnorm.cpp"
 #include "kernel_rope.cpp"
+#include "kernel_silu.cpp"
 #include "kernel_softmax.cpp"
 
+#include <float.h>
 #include <math.h>
+#include <stdint.h>
 
-namespace swan {
+namespace llama2 {
 
 constexpr int kHeadDim = kDim / kNumHeads;
+constexpr int kVocabTile = 128;
+constexpr int kTasksPerLayer = 7;
+
+enum class Task {
+  AttnQ = 0,
+  AttnK = 1,
+  AttnV = 2,
+  AttnO = 3,
+  FfnW1 = 4,
+  FfnW3 = 5,
+  FfnW2 = 6,
+  LmHead = 7,
+};
 
 inline int rms_idx(int layer, int i) { return layer * kDim + i; }
 inline int attn_idx(int layer, int row, int col) {
@@ -29,9 +45,9 @@ inline int cache_idx(int layer, int pos, int i) {
   return (layer * kSeqLen + pos) * kDim + i;
 }
 
-} // namespace swan
+} // namespace llama2
 
-using namespace swan;
+using namespace llama2;
 
 extern "C" {
 
@@ -42,24 +58,30 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
                    const float* ffn_w1, const float* ffn_w2,
                    const float* ffn_w3, const float* rms_final,
                    const float* cos_table, const float* sin_table,
-                   float* k_cache, float* v_cache, float* logits) {
-#pragma HLS INTERFACE m_axi port = tok_emb_table bundle = gmem0
-#pragma HLS INTERFACE m_axi port = rms_att_w bundle = gmem1
-#pragma HLS INTERFACE m_axi port = attn_wq bundle = gmem2
-#pragma HLS INTERFACE m_axi port = attn_wk bundle = gmem3
-#pragma HLS INTERFACE m_axi port = attn_wv bundle = gmem4
-#pragma HLS INTERFACE m_axi port = attn_wo bundle = gmem5
-#pragma HLS INTERFACE m_axi port = rms_ffn_w bundle = gmem6
-#pragma HLS INTERFACE m_axi port = ffn_w1 bundle = gmem7
-#pragma HLS INTERFACE m_axi port = ffn_w2 bundle = gmem8
-#pragma HLS INTERFACE m_axi port = ffn_w3 bundle = gmem9
-#pragma HLS INTERFACE m_axi port = rms_final bundle = gmem10
-#pragma HLS INTERFACE m_axi port = cos_table bundle = gmem11
-#pragma HLS INTERFACE m_axi port = sin_table bundle = gmem12
-#pragma HLS INTERFACE m_axi port = k_cache bundle = gmem13
-#pragma HLS INTERFACE m_axi port = v_cache bundle = gmem14
-#pragma HLS INTERFACE m_axi port = logits bundle = gmem15
+                   float* k_cache, float* v_cache, uint32_t* next_token) {
+// -------------------------
+// Stage 0: AXI interfaces.
+// -------------------------
+#pragma HLS INTERFACE m_axi port = tok_emb_table bundle = gmem
+#pragma HLS INTERFACE m_axi port = rms_att_w bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wq bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wk bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wv bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wo bundle = gmem
+#pragma HLS INTERFACE m_axi port = rms_ffn_w bundle = gmem
+#pragma HLS INTERFACE m_axi port = ffn_w1 bundle = gmem
+#pragma HLS INTERFACE m_axi port = ffn_w2 bundle = gmem
+#pragma HLS INTERFACE m_axi port = ffn_w3 bundle = gmem
+#pragma HLS INTERFACE m_axi port = rms_final bundle = gmem
+#pragma HLS INTERFACE m_axi port = cos_table bundle = gmem
+#pragma HLS INTERFACE m_axi port = sin_table bundle = gmem
+#pragma HLS INTERFACE m_axi port = k_cache bundle = gmem
+#pragma HLS INTERFACE m_axi port = v_cache bundle = gmem
+#pragma HLS INTERFACE m_axi port = next_token bundle = gmem
 
+  // -------------------------
+  // Stage 1: on-chip buffers.
+  // -------------------------
   Tensor1d hidden;
   Tensor1d attn_input;
   Tensor1d attn_norm;
@@ -76,84 +98,180 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
   Tensor1d ffn_norm;
   Tensor1dFFNB ffn_w1x;
   Tensor1dFFNB ffn_w3x;
+  Tensor1dFFNB ffn_act;
   Tensor1dFFNB ffn_dot;
   Tensor1d ffn_out;
   Tensor1d final_norm;
+  float score_tile[kVocabTile];
 
+  // -------------------------
+  // Stage 2: token embedding.
+  // -------------------------
   for (int i = 0; i < kDim; ++i) {
 #pragma HLS PIPELINE II = 1
     hidden[i] = tok_emb_table[token * kDim + i];
   }
 
   const float attn_scale = 1.0f / sqrtf(static_cast<float>(kHeadDim));
+  constexpr int kLayerLinearTaskCount = kNumLayers * kTasksPerLayer;
+  constexpr int kLmHeadTileCount =
+      (kVocabSize + kVocabTile - 1) / kVocabTile;
+  constexpr int kLinearTaskCount = kLayerLinearTaskCount + kLmHeadTileCount;
+  float best_score = -FLT_MAX;
+  uint32_t best_token = 0;
 
-  for (int layer = 0; layer < kNumLayers; ++layer) {
-    for (int i = 0; i < kDim; ++i) {
+  // -------------------------
+  // Stage 3: shared GEMV schedule.
+  // -------------------------
+  for (int linear_task = 0; linear_task < kLinearTaskCount; ++linear_task) {
+    const bool lm_head_task = linear_task >= kLayerLinearTaskCount;
+    const int layer = lm_head_task ? 0 : linear_task / kTasksPerLayer;
+    const int layer_task =
+        lm_head_task ? 0 : linear_task - layer * kTasksPerLayer;
+    const int lm_head_tile = linear_task - kLayerLinearTaskCount;
+    const int vocab_base = lm_head_tile * kVocabTile;
+    const Task task =
+        lm_head_task ? Task::LmHead : static_cast<Task>(layer_task);
+
+    const float* linear_src = final_norm;
+    const float* linear_weight = tok_emb_table;
+    float* linear_dst = hidden;
+    int linear_rows = kDim;
+    int linear_cols = kDim;
+
+    switch (task) {
+    case Task::LmHead:
+      if (lm_head_tile == 0) {
+        kernel_rmsnorm(final_norm, hidden, rms_final);
+        best_score = -FLT_MAX;
+        best_token = 0;
+      }
+      linear_src = final_norm;
+      linear_weight = &tok_emb_table[vocab_base * kDim];
+      linear_dst = score_tile;
+      linear_rows = kVocabTile;
+      if (vocab_base + kVocabTile > kVocabSize) {
+        linear_rows = kVocabSize - vocab_base;
+      }
+      linear_cols = kDim;
+      break;
+    case Task::AttnQ:
+      for (int i = 0; i < kDim; ++i) {
 #pragma HLS PIPELINE II = 1
-      attn_input[i] = hidden[i];
-    }
+        attn_input[i] = hidden[i];
+      }
+      kernel_rmsnorm(attn_norm, attn_input, &rms_att_w[rms_idx(layer, 0)]);
+      linear_src = attn_norm;
+      linear_weight = &attn_wq[attn_idx(layer, 0, 0)];
+      linear_dst = q;
+      linear_rows = kDim;
+      linear_cols = kDim;
+      break;
+    case Task::AttnK:
+      linear_src = attn_norm;
+      linear_weight = &attn_wk[attn_idx(layer, 0, 0)];
+      linear_dst = k;
+      linear_rows = kDim;
+      linear_cols = kDim;
+      break;
+    case Task::AttnV:
+      linear_src = attn_norm;
+      linear_weight = &attn_wv[attn_idx(layer, 0, 0)];
+      linear_dst = v;
+      linear_rows = kDim;
+      linear_cols = kDim;
+      break;
+    case Task::AttnO:
+      // Prepare attention values before the output projection.
+      kernel_rope(q_rot, k_rot, q, k, cos_table, sin_table, pos);
 
-    kernel_rmsnorm(attn_norm, attn_input, &rms_att_w[rms_idx(layer, 0)]);
-    kernel_matmul(q, kDim, attn_norm, kDim, &attn_wq[attn_idx(layer, 0, 0)]);
-    kernel_matmul(k, kDim, attn_norm, kDim, &attn_wk[attn_idx(layer, 0, 0)]);
-    kernel_matmul(v, kDim, attn_norm, kDim, &attn_wv[attn_idx(layer, 0, 0)]);
-    kernel_rope(q_rot, k_rot, q, k, cos_table, sin_table, pos);
-
-    for (int i = 0; i < kDim; ++i) {
+      for (int i = 0; i < kDim; ++i) {
 #pragma HLS PIPELINE II = 1
-      k_cache[cache_idx(layer, pos, i)] = k_rot[i];
-      v_cache[cache_idx(layer, pos, i)] = v[i];
-      attn_val[i] = 0.0f;
-    }
-
-    for (int head = 0; head < kNumHeads; ++head) {
-      const int head_begin = head * kHeadDim;
-      const int head_end = head_begin + kHeadDim;
-
-      for (int t = 0; t <= pos; ++t) {
-        float sum = 0.0f;
-        for (int i = head_begin; i < head_end; ++i) {
-#pragma HLS PIPELINE II = 1
-          sum += q_rot[i] * k_cache[cache_idx(layer, t, i)];
-        }
-        qk[t] = sum * attn_scale;
+        k_cache[cache_idx(layer, pos, i)] = k_rot[i];
+        v_cache[cache_idx(layer, pos, i)] = v[i];
+        attn_val[i] = 0.0f;
       }
 
-      kernel_softmax(sm, qk, pos + 1);
+      for (int head = 0; head < kNumHeads; ++head) {
+        const int head_begin = head * kHeadDim;
+        const int head_end = head_begin + kHeadDim;
 
-      for (int i = head_begin; i < head_end; ++i) {
-        float sum = 0.0f;
         for (int t = 0; t <= pos; ++t) {
+          float sum = 0.0f;
+          for (int i = head_begin; i < head_end; ++i) {
 #pragma HLS PIPELINE II = 1
-          sum += sm[t] * v_cache[cache_idx(layer, t, i)];
+            sum += q_rot[i] * k_cache[cache_idx(layer, t, i)];
+          }
+          qk[t] = sum * attn_scale;
         }
-        attn_val[i] = sum;
-      }
-    }
 
-    kernel_matmul(attn_out, kDim, attn_val, kDim,
-                  &attn_wo[attn_idx(layer, 0, 0)]);
-    kernel_add(attn_res, attn_input, attn_out);
-    kernel_rmsnorm(ffn_norm, attn_res, &rms_ffn_w[rms_idx(layer, 0)]);
-    kernel_matmul(ffn_w1x, kFFNDim, ffn_norm, kDim,
-                  &ffn_w1[ffn_a_idx(layer, 0, 0)]);
-    kernel_matmul(ffn_w3x, kFFNDim, ffn_norm, kDim,
-                  &ffn_w3[ffn_a_idx(layer, 0, 0)]);
-    kernel_mul(ffn_dot, ffn_w1x, ffn_w3x);
-    kernel_matmul(ffn_out, kDim, ffn_dot, kFFNDim,
-                  &ffn_w2[ffn_b_idx(layer, 0, 0)]);
-    kernel_add(hidden, attn_res, ffn_out);
-  }
+        kernel_softmax(sm, qk, pos + 1);
 
-  kernel_rmsnorm(final_norm, hidden, rms_final);
-
-  for (int tok = 0; tok < kVocabSize; ++tok) {
-    float sum = 0.0f;
-    for (int i = 0; i < kDim; ++i) {
+        for (int i = head_begin; i < head_end; ++i) {
+          float sum = 0.0f;
+          for (int t = 0; t <= pos; ++t) {
 #pragma HLS PIPELINE II = 1
-      sum += tok_emb_table[tok * kDim + i] * final_norm[i];
+            sum += sm[t] * v_cache[cache_idx(layer, t, i)];
+          }
+          attn_val[i] = sum;
+        }
+      }
+
+      linear_src = attn_val;
+      linear_weight = &attn_wo[attn_idx(layer, 0, 0)];
+      linear_dst = attn_out;
+      linear_rows = kDim;
+      linear_cols = kDim;
+      break;
+    case Task::FfnW1:
+      kernel_add(attn_res, attn_input, attn_out);
+      kernel_rmsnorm(ffn_norm, attn_res, &rms_ffn_w[rms_idx(layer, 0)]);
+      linear_src = ffn_norm;
+      linear_weight = &ffn_w1[ffn_a_idx(layer, 0, 0)];
+      linear_dst = ffn_w1x;
+      linear_rows = kFFNDim;
+      linear_cols = kDim;
+      break;
+    case Task::FfnW3:
+      linear_src = ffn_norm;
+      linear_weight = &ffn_w3[ffn_a_idx(layer, 0, 0)];
+      linear_dst = ffn_w3x;
+      linear_rows = kFFNDim;
+      linear_cols = kDim;
+      break;
+    case Task::FfnW2:
+      kernel_silu(ffn_act, ffn_w1x);
+      kernel_mul(ffn_dot, ffn_act, ffn_w3x);
+      linear_src = ffn_dot;
+      linear_weight = &ffn_w2[ffn_b_idx(layer, 0, 0)];
+      linear_dst = ffn_out;
+      linear_rows = kDim;
+      linear_cols = kFFNDim;
+      break;
     }
-    logits[tok] = sum;
+
+    kernel_matmul(linear_dst, linear_rows, linear_src, linear_cols,
+                  linear_weight);
+
+    switch (task) {
+    case Task::LmHead:
+      for (int i = 0; i < linear_rows; ++i) {
+#pragma HLS PIPELINE II = 1
+        if (score_tile[i] > best_score) {
+          best_score = score_tile[i];
+          best_token = static_cast<uint32_t>(vocab_base + i);
+        }
+      }
+      if (lm_head_tile == kLmHeadTileCount - 1) {
+        *next_token = best_token;
+      }
+      break;
+    case Task::FfnW2:
+      kernel_add(hidden, attn_res, ffn_out);
+      break;
+    default:
+      break;
+    }
   }
 }
 
@@ -166,16 +284,17 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
 #include <cmath>
 #include <cstring>
 
-namespace swan {
+namespace llama2 {
 
 void Decode(int tok, int pos, const Tensor1d& ctx_input,
             Tensor3dCache& ctx_k_cache, Tensor3dCache& ctx_v_cache,
             Tensor1d& ctx_final_norm, Tensor1dLogits& ctx_logits,
+            int& next_token,
             const Weights& w
 #ifndef USE_CPU_ONLY
             ,
-            cl::CommandQueue q, cl::Kernel kernel_decode, float* ptr_logits,
-            cl::Buffer buffer_logits
+            cl::CommandQueue q, cl::Kernel kernel_decode, uint32_t* ptr_next,
+            cl::Buffer buffer_next
 #endif // USE_CPU_ONLY
 ) {
 #ifndef USE_CPU_ONLY
@@ -183,16 +302,17 @@ void Decode(int tok, int pos, const Tensor1d& ctx_input,
   (void)ctx_k_cache;
   (void)ctx_v_cache;
   (void)ctx_final_norm;
+  (void)ctx_logits;
   (void)w;
 
   kernel_decode.setArg(0, tok);
   kernel_decode.setArg(1, pos);
-  q.enqueueNDRangeKernel(kernel_decode, cl::NullRange, cl::NDRange(1),
-                         cl::NullRange);
-  q.enqueueMigrateMemObjects({buffer_logits}, CL_MIGRATE_MEM_OBJECT_HOST);
+  q.enqueueTask(kernel_decode);
+  q.enqueueMigrateMemObjects({buffer_next}, CL_MIGRATE_MEM_OBJECT_HOST);
   q.finish();
-  std::memcpy(ctx_logits, ptr_logits, sizeof(Tensor1dLogits));
+  next_token = static_cast<int>(*ptr_next);
 #else
+  (void)next_token;
   static Context ctx;
 
   const int head_dim = kDim / kNumLayers;
@@ -248,6 +368,6 @@ void Decode(int tok, int pos, const Tensor1d& ctx_input,
 #endif
 }
 
-} // namespace swan
+} // namespace llama2
 
 #endif // BUILD_DECODE_KERNEL

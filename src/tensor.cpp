@@ -3,7 +3,7 @@
 #include <cmath>
 #include <fstream>
 
-namespace swan {
+namespace llama2 {
 
 /* ---------------------------------  /
               Copy Tensor
@@ -389,4 +389,4 @@ void RoPE(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in, const Tensor1d
   }
 }
 
-} // namespace swan
+} // namespace llama2

@@ -5,7 +5,7 @@
 
 #include "tensor.hpp"
 
-namespace swan {
+namespace llama2 {
 
 struct Context {
   // Input
@@ -44,6 +44,6 @@ struct Context {
 
 void DumpContext(std::string prefix, const Context& ctx, int n_layers);
 
-} // namespace swan
+} // namespace llama2
 
 #endif // CONTEXT_HPP_

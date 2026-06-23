@@ -6,7 +6,7 @@
 
 #include "tensor.hpp"
 
-namespace swan {
+namespace llama2 {
 
 struct Weights {
   // Dummy variable for alignment
@@ -35,6 +35,6 @@ struct Weights {
 
 void LoadWeights(Weights& w, Tensor2dTok& tok, std::ifstream& fs);
 
-} // namespace swan
+} // namespace llama2
 
 #endif // WEIGHT_HPP_

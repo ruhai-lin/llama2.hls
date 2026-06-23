@@ -1,6 +1,6 @@
 #include <cstring>
 #include <chrono>
-#include <iomanip>
+#include <cstdint>
 #include <iostream>
 #include <random>
 #include <utility>
@@ -49,6 +49,16 @@ std::vector<float, aligned_allocator<float>> FlattenWeights(const T& data,
               count * sizeof(float));
   return flat;
 }
+
+template <typename T>
+cl::Buffer CreateKernelArgBuffer(const cl::Context& context,
+                                 const cl::Kernel& kernel, unsigned int argidx,
+                                 cl_mem_flags flags, std::size_t bytes,
+                                 T* host_ptr, cl_int* err) {
+  (void)kernel;
+  (void)argidx;
+  return cl::Buffer(context, flags | CL_MEM_USE_HOST_PTR, bytes, host_ptr, err);
+}
 #endif // USE_CPU_ONLY
 
 // Command line arguments.
@@ -91,12 +101,12 @@ void ParseArgument(int argc, char* argv[], Args& args) {
 }
 
 // Random Sampling
-int SelectFromLogits(const swan::Tensor1dLogits& prob_dist) {
+int SelectFromLogits(const llama2::Tensor1dLogits& prob_dist) {
   std::random_device rd;
   std::mt19937 gen(rd());
   std::uniform_real_distribution<> dis(0, 1);
 
-  const int vocab_size = swan::kVocabSize;
+  const int vocab_size = llama2::kVocabSize;
   float rand = dis(gen);
 
   float cdf = 0.0;
@@ -131,13 +141,13 @@ int main(int argc, char* argv[]) {
 
   // 2. Print hyper parameters.
   std::cout << "Hyper Parameters" << std::endl
-            << "  dim       : " << swan::kDim << std::endl
-            << "  ffn_dim   : " << swan::kFFNDim << std::endl
-            << "  n_layers  : " << swan::kNumLayers << std::endl
-            << "  n_heads   : " << swan::kNumHeads << std::endl
-            << "  n_kv_heads: " << swan::kNumKVHeads << std::endl
-            << "  vocab_size: " << swan::kVocabSize << std::endl
-            << "  seq_len   : " << swan::kSeqLen << std::endl;
+            << "  dim       : " << llama2::kDim << std::endl
+            << "  ffn_dim   : " << llama2::kFFNDim << std::endl
+            << "  n_layers  : " << llama2::kNumLayers << std::endl
+            << "  n_heads   : " << llama2::kNumHeads << std::endl
+            << "  n_kv_heads: " << llama2::kNumKVHeads << std::endl
+            << "  vocab_size: " << llama2::kVocabSize << std::endl
+            << "  seq_len   : " << llama2::kSeqLen << std::endl;
 
   // 3. Load model parameters.
   std::ifstream weight_fs(args.weight_path, std::ios::in | std::ios::binary);
@@ -145,9 +155,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Failed to open: " << args.weight_path << std::endl;
     return EXIT_FAILURE;
   }
-  static swan::Weights weights;
-  static swan::Tensor2dTok tok_emb_table; // [vocab_size, dim]
-  swan::LoadWeights(weights, tok_emb_table, weight_fs);
+  static llama2::Weights weights;
+  static llama2::Tensor2dTok tok_emb_table; // [vocab_size, dim]
+  llama2::LoadWeights(weights, tok_emb_table, weight_fs);
   weight_fs.close();
 
   // 4. Load vocabrary.
@@ -156,29 +166,28 @@ int main(int argc, char* argv[]) {
     std::cout << "Failed to open: " << args.vocab_path << std::endl;
     return EXIT_FAILURE;
   }
-  static swan::Vocab vocab;
-  const int vocab_size = swan::kVocabSize;
-  swan::ResizeVocab(vocab, vocab_size);
-  swan::LoadVocab(vocab, vocab_fs);
+  static llama2::Vocab vocab;
+  const int vocab_size = llama2::kVocabSize;
+  llama2::ResizeVocab(vocab, vocab_size);
+  llama2::LoadVocab(vocab, vocab_fs);
   vocab_fs.close();
 
 #ifndef USE_CPU_ONLY
   // 5. OpenCL Settings
   std::string xclbinFilename = "./binary_container_1.bin";
 
-  constexpr std::size_t tok_emb_count = swan::kVocabSize * swan::kDim;
-  constexpr std::size_t rms_count = swan::kNumLayers * swan::kDim;
+  constexpr std::size_t tok_emb_count = llama2::kVocabSize * llama2::kDim;
+  constexpr std::size_t rms_count = llama2::kNumLayers * llama2::kDim;
   constexpr std::size_t attn_count =
-      swan::kNumLayers * swan::kDim * swan::kDim;
+      llama2::kNumLayers * llama2::kDim * llama2::kDim;
   constexpr std::size_t ffn_a_count =
-      swan::kNumLayers * swan::kFFNDim * swan::kDim;
+      llama2::kNumLayers * llama2::kFFNDim * llama2::kDim;
   constexpr std::size_t ffn_b_count =
-      swan::kNumLayers * swan::kDim * swan::kFFNDim;
-  constexpr std::size_t rms_final_count = swan::kDim;
-  constexpr std::size_t sincos_count = swan::kSeqLen * swan::kSinCosTable;
+      llama2::kNumLayers * llama2::kDim * llama2::kFFNDim;
+  constexpr std::size_t rms_final_count = llama2::kDim;
+  constexpr std::size_t sincos_count = llama2::kSeqLen * llama2::kSinCosTable;
   constexpr std::size_t cache_count =
-      swan::kNumLayers * swan::kSeqLen * swan::kDim;
-  constexpr std::size_t logits_count = swan::kVocabSize;
+      llama2::kNumLayers * llama2::kSeqLen * llama2::kDim;
 
   auto tok_emb_host = FlattenWeights(tok_emb_table, tok_emb_count);
   auto rms_att_host = FlattenWeights(weights.rms_att_w, rms_count);
@@ -195,7 +204,7 @@ int main(int argc, char* argv[]) {
   auto sin_host = FlattenWeights(weights.sin_table, sincos_count);
   std::vector<float, aligned_allocator<float>> k_cache_host(cache_count, 0.0f);
   std::vector<float, aligned_allocator<float>> v_cache_host(cache_count, 0.0f);
-  std::vector<float, aligned_allocator<float>> logits_host(logits_count, 0.0f);
+  std::vector<uint32_t, aligned_allocator<uint32_t>> next_host(1, 0);
 
   std::vector<cl::Device> devices;
   cl_int err;
@@ -272,55 +281,55 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  OCL_CHECK(err, cl::Buffer buffer_tok_emb(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_tok_emb = CreateKernelArgBuffer(
+                     context, kernel_decode, 2, CL_MEM_READ_ONLY,
                      tok_emb_count * sizeof(float), tok_emb_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_rms_att(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_rms_att = CreateKernelArgBuffer(
+                     context, kernel_decode, 3, CL_MEM_READ_ONLY,
                      rms_count * sizeof(float), rms_att_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wq(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_attn_wq = CreateKernelArgBuffer(
+                     context, kernel_decode, 4, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wq_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wk(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_attn_wk = CreateKernelArgBuffer(
+                     context, kernel_decode, 5, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wk_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wv(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_attn_wv = CreateKernelArgBuffer(
+                     context, kernel_decode, 6, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wv_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wo(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_attn_wo = CreateKernelArgBuffer(
+                     context, kernel_decode, 7, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wo_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_rms_ffn(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_rms_ffn = CreateKernelArgBuffer(
+                     context, kernel_decode, 8, CL_MEM_READ_ONLY,
                      rms_count * sizeof(float), rms_ffn_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_ffn_w1(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_ffn_w1 = CreateKernelArgBuffer(
+                     context, kernel_decode, 9, CL_MEM_READ_ONLY,
                      ffn_a_count * sizeof(float), ffn_w1_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_ffn_w2(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_ffn_w2 = CreateKernelArgBuffer(
+                     context, kernel_decode, 10, CL_MEM_READ_ONLY,
                      ffn_b_count * sizeof(float), ffn_w2_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_ffn_w3(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_ffn_w3 = CreateKernelArgBuffer(
+                     context, kernel_decode, 11, CL_MEM_READ_ONLY,
                      ffn_a_count * sizeof(float), ffn_w3_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_rms_final(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_rms_final = CreateKernelArgBuffer(
+                     context, kernel_decode, 12, CL_MEM_READ_ONLY,
                      rms_final_count * sizeof(float), rms_final_host.data(),
                      &err));
-  OCL_CHECK(err, cl::Buffer buffer_cos(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_cos = CreateKernelArgBuffer(
+                     context, kernel_decode, 13, CL_MEM_READ_ONLY,
                      sincos_count * sizeof(float), cos_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_sin(
-                     context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_sin = CreateKernelArgBuffer(
+                     context, kernel_decode, 14, CL_MEM_READ_ONLY,
                      sincos_count * sizeof(float), sin_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_k_cache(
-                     context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_k_cache = CreateKernelArgBuffer(
+                     context, kernel_decode, 15, CL_MEM_READ_WRITE,
                      cache_count * sizeof(float), k_cache_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_v_cache(
-                     context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
+  OCL_CHECK(err, cl::Buffer buffer_v_cache = CreateKernelArgBuffer(
+                     context, kernel_decode, 16, CL_MEM_READ_WRITE,
                      cache_count * sizeof(float), v_cache_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_logits(
-                     context, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
-                     logits_count * sizeof(float), logits_host.data(), &err));
+  OCL_CHECK(err, cl::Buffer buffer_next = CreateKernelArgBuffer(
+                     context, kernel_decode, 17, CL_MEM_WRITE_ONLY,
+                     sizeof(uint32_t), next_host.data(), &err));
 
   OCL_CHECK(err, err = kernel_decode.setArg(2, buffer_tok_emb));
   OCL_CHECK(err, err = kernel_decode.setArg(3, buffer_rms_att));
@@ -337,7 +346,7 @@ int main(int argc, char* argv[]) {
   OCL_CHECK(err, err = kernel_decode.setArg(14, buffer_sin));
   OCL_CHECK(err, err = kernel_decode.setArg(15, buffer_k_cache));
   OCL_CHECK(err, err = kernel_decode.setArg(16, buffer_v_cache));
-  OCL_CHECK(err, err = kernel_decode.setArg(17, buffer_logits));
+  OCL_CHECK(err, err = kernel_decode.setArg(17, buffer_next));
 
   OCL_CHECK(err,
             err = q.enqueueMigrateMemObjects(
@@ -351,33 +360,42 @@ int main(int argc, char* argv[]) {
 #endif // USE_CPU_ONLY
 
   // 6. Decode
-  static swan::Context ctx;
-  swan::Tensor1d ctx_input;
-  static swan::Tensor3dCache ctx_k_cache;
-  static swan::Tensor3dCache ctx_v_cache;
-  swan::Tensor1dLogits ctx_logits;
-  swan::Tensor1d ctx_final_norm;
+  static llama2::Context ctx;
+  llama2::Tensor1d ctx_input;
+  static llama2::Tensor3dCache ctx_k_cache;
+  static llama2::Tensor3dCache ctx_v_cache;
+  llama2::Tensor1dLogits ctx_logits;
+  llama2::Tensor1d ctx_final_norm;
 
   auto start_clk = std::chrono::steady_clock::now();
 
   int next;
   int token = 1; // BOS (Begin of Sequence)
 
+#ifndef USE_CPU_ONLY
+  if (args.temp >= 1e-5) {
+    std::cerr << "[ERROR] FPGA build returns exact argmax token only; use "
+                 "--temp 0 for now."
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+#endif // USE_CPU_ONLY
+
   for (int pos = 0; pos < args.max_seq; ++pos) {
 
     // 6-1. Load the context input and decode the next token.
-    swan::CopyTensor1d(ctx_input, tok_emb_table[token]);
-    swan::Decode(token, pos, ctx_input, ctx_k_cache, ctx_v_cache,
-                 ctx_final_norm, ctx_logits, weights
+    llama2::CopyTensor1d(ctx_input, tok_emb_table[token]);
+    llama2::Decode(token, pos, ctx_input, ctx_k_cache, ctx_v_cache,
+                 ctx_final_norm, ctx_logits, next, weights
 #ifndef USE_CPU_ONLY
                  ,
-                 q, kernel_decode, logits_host.data(), buffer_logits
+                 q, kernel_decode, next_host.data(), buffer_next
 #endif // USE_CPU_ONLY
     );
 
 #ifdef USE_CPU_ONLY
     // 6-2. Calculate the logits and softmax.
-    swan::MutmulVocab(ctx_logits, ctx_final_norm, tok_emb_table);
+    llama2::MutmulVocab(ctx_logits, ctx_final_norm, tok_emb_table);
 #endif // USE_CPU_ONLY
 
     if (args.print_softmax) {
@@ -395,17 +413,19 @@ int main(int argc, char* argv[]) {
     }
 
     // 6-3. Sampling the next token.
+#ifdef USE_CPU_ONLY
     if (args.temp < 1e-5) {
-      next = swan::Argmax(ctx_logits);
+      next = llama2::Argmax(ctx_logits);
     } else {
       for (int q = 0; q < vocab_size; ++q) {
         ctx_logits[q] /= args.temp;
       }
-      swan::Softmax(ctx_logits, ctx_logits);
+      llama2::Softmax(ctx_logits, ctx_logits);
       next = SelectFromLogits(ctx_logits);
     }
+#endif // USE_CPU_ONLY
 
-    const std::string piece = swan::DecodePiece(vocab, token, next);
+    const std::string piece = llama2::DecodePiece(vocab, token, next);
     if (args.color) {
       std::cout << "\e[31m";
       std::cout.write(piece.data(), piece.size());
@@ -418,7 +438,7 @@ int main(int argc, char* argv[]) {
     // Dump the contexts.
     if (args.log) {
 #ifdef USE_CPU_ONLY
-      DumpContext("log/" + std::to_string(pos) + "_", ctx, swan::kNumLayers);
+      DumpContext("log/" + std::to_string(pos) + "_", ctx, llama2::kNumLayers);
 #else
       std::cerr << "--log is only available in CPU-only builds.\n";
 #endif

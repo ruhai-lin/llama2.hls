@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace swan {
+namespace llama2 {
 
 struct Vocab {
   std::vector<std::string> dict;
@@ -17,6 +17,6 @@ void ResizeVocab(Vocab& vocab, int vocab_size);
 void LoadVocab(Vocab& vocab, std::ifstream& fs);
 std::string DecodePiece(const Vocab& vocab, int prev_token, int token);
 
-} // namespace swan
+} // namespace llama2
 
 #endif // VOCAB_HPP_

@@ -4,7 +4,7 @@
 
 #include <math.h>
 
-namespace swan {
+namespace llama2 {
 
 static void kernel_rmsnorm(Tensor1d& out, const Tensor1d& in,
                            const float* weight) {
@@ -21,6 +21,6 @@ static void kernel_rmsnorm(Tensor1d& out, const Tensor1d& in,
   }
 }
 
-} // namespace swan
+} // namespace llama2
 
 #endif // BUILD_DECODE_KERNEL

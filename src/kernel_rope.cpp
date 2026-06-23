@@ -2,7 +2,7 @@
 
 #include "tensor.hpp"
 
-namespace swan {
+namespace llama2 {
 
 static void kernel_rope(Tensor1d& q_out, Tensor1d& k_out,
                         const Tensor1d& q_in, const Tensor1d& k_in,
@@ -30,6 +30,6 @@ static void kernel_rope(Tensor1d& q_out, Tensor1d& k_out,
   }
 }
 
-} // namespace swan
+} // namespace llama2
 
 #endif // BUILD_DECODE_KERNEL

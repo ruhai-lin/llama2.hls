@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <stdexcept>
 
-namespace swan {
+namespace llama2 {
 
 // ResizeVocab resizes the vocab to the given size.
 void ResizeVocab(Vocab& vocab, int vocab_size) {
@@ -55,4 +55,4 @@ std::string DecodePiece(const Vocab& vocab, int prev_token, int token) {
   return piece;
 }
 
-} // namespace swan
+} // namespace llama2

@@ -10,5 +10,5 @@ message("# SOURCES: ${SOURCES}")
 include_directories(src)
 
 # プロジェクトの設定
-project(swan CXX)
-add_executable(swan ${SOURCES})
+project(llama2 CXX)
+add_executable(llama2 ${SOURCES})

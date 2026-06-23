@@ -4,7 +4,7 @@
 
 #include <math.h>
 
-namespace swan {
+namespace llama2 {
 
 static void kernel_softmax(Tensor1dQKSM& out, const Tensor1dQKSM& in,
                            int size) {
@@ -30,6 +30,6 @@ static void kernel_softmax(Tensor1dQKSM& out, const Tensor1dQKSM& in,
   }
 }
 
-} // namespace swan
+} // namespace llama2
 
 #endif // BUILD_DECODE_KERNEL

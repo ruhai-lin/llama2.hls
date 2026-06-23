@@ -2,7 +2,7 @@
 
 #include <fstream>
 
-namespace swan {
+namespace llama2 {
 
 void DumpTensor1d(std::string file, const Tensor1d& tensor) {
   std::ofstream fs(file);
@@ -62,4 +62,4 @@ void DumpContext(std::string prefix, const Context& ctx, int n_layers) {
   // DumpTensor1d(prefix + "logits", ctx.logits);
 }
 
-} // namespace swan
+} // namespace llama2

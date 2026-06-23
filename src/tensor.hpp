@@ -3,7 +3,7 @@
 
 #include <string>
 
-namespace swan {
+namespace llama2 {
 
 constexpr int kDim = 288;
 constexpr int kVocabSize = 32000;
@@ -76,6 +76,6 @@ void RoPE(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in,
           const Tensor1d& k_in, const Tensor1dSinCos& cos_vec,
           const Tensor1dSinCos& sin_vec, int head_begin, int head_size);
 
-} // namespace swan
+} // namespace llama2
 
 #endif // TENSOR_HPP_
