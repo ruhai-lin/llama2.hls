@@ -5,6 +5,60 @@
 
 namespace llama2 {
 
+static int8_t ClampQ8(float x) {
+  if (x > 127.0f) {
+    return 127;
+  }
+  if (x < -127.0f) {
+    return -127;
+  }
+  return static_cast<int8_t>(std::round(x));
+}
+
+static void QuantizeVector(int8_t* q, float* s, const float* x, int n) {
+  for (int group = 0; group < n / kQuantGroupSize; ++group) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < kQuantGroupSize; ++i) {
+      const float val = std::fabs(x[group * kQuantGroupSize + i]);
+      if (val > max_abs) {
+        max_abs = val;
+      }
+    }
+
+    const float scale = max_abs / 127.0f;
+    s[group] = scale;
+    for (int i = 0; i < kQuantGroupSize; ++i) {
+      const int idx = group * kQuantGroupSize + i;
+      q[idx] = scale == 0.0f ? 0 : ClampQ8(x[idx] / scale);
+    }
+  }
+}
+
+static void QuantizedMatmul(float* out, int out_size, const float* in,
+                            int in_size, const int8_t* weight_q,
+                            const float* weight_s) {
+  int8_t in_q[kFFNDim];
+  float in_s[kFFNGroups];
+  QuantizeVector(in_q, in_s, in, in_size);
+
+  const int group_count = in_size / kQuantGroupSize;
+  for (int row = 0; row < out_size; ++row) {
+    float sum = 0.0f;
+    for (int group = 0; group < group_count; ++group) {
+      int32_t dot = 0;
+      const int base = group * kQuantGroupSize;
+      for (int i = 0; i < kQuantGroupSize; ++i) {
+        const int col = base + i;
+        dot += static_cast<int32_t>(in_q[col]) *
+               static_cast<int32_t>(weight_q[row * in_size + col]);
+      }
+      sum += static_cast<float>(dot) * in_s[group] *
+             weight_s[row * group_count + group];
+    }
+    out[row] = sum;
+  }
+}
+
 /* ---------------------------------  /
               Copy Tensor
 /  --------------------------------- */
@@ -108,66 +162,24 @@ float InnerProduct(const Tensor1d& lhs, const Tensor1d& rhs) {
   return sum;
 }
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1d [dim] . Tensor2dAttn [dim, dim] = Tensor1d [dim]
-// out[i] = w[i,j] . in[j]
-void Matmul(Tensor1d& out, const Tensor1d& in, const Tensor2dAttn& w) {
-  for (size_t i = 0; i < kDim; ++i) {
-    float sum = 0;
-    for (size_t j = 0; j < kDim; j++) {
-      sum += w[i][j] * in[j];
-    }
-    out[i] = sum;
-  }
+void Matmul(Tensor1d& out, const Tensor1d& in, const Tensor2dAttnQ& w,
+            const Tensor2dAttnS& s) {
+  QuantizedMatmul(out, kDim, in, kDim, &w[0][0], &s[0][0]);
 }
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1dFFNB [ffn_dim] . Tensor2dFFNA [ffn_dim, dim] = Tensor1dFFNB [ffn_dim]
-// out[i] = w[i,j] . in[j]
-void Matmul(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNA& w) {
-  for (size_t i = 0; i < kFFNDim; ++i) {
-    float sum = 0;
-    for (size_t j = 0; j < kDim; j++) {
-      sum += w[i][j] * in[j];
-    }
-    out[i] = sum;
-  }
+void Matmul(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNAQ& w,
+            const Tensor2dFFNAS& s) {
+  QuantizedMatmul(out, kFFNDim, in, kDim, &w[0][0], &s[0][0]);
 }
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1d [dim] . Tensor2dFFNB [dim, ffn_dim] = Tensor1dFFNB [ffn_dim]
-// out[i] = w[i,j] . in[j]
-void Matmul(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNB& w) {
-  for (size_t i = 0; i < kDim; ++i) {
-    float sum = 0;
-    for (size_t j = 0; j < kFFNDim; j++) {
-      sum += w[i][j] * in[j];
-    }
-    out[i] = sum;
-  }
+void Matmul(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNBQ& w,
+            const Tensor2dFFNBS& s) {
+  QuantizedMatmul(out, kDim, in, kFFNDim, &w[0][0], &s[0][0]);
 }
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1d [dim] . Tensor2dTok [vocab_size, dim] = Tensor1dLogits [vocab_size]
-// out[i] = w[i,j] . in[j]
-void MutmulVocab(Tensor1dLogits& out, const Tensor1d& in, const Tensor2dTok& w) {
-  float x[kDim];
-  float w_vec[kDim];
-  float in_tmp[kDim];
-  for (size_t i = 0; i < kVocabSize; ++i) {
-    float sum = 0;
-    for (size_t j = 0; j < kDim; j++) {
-      w_vec[j] = w[i][j];
-      in_tmp[j] = in[j];
-    }
-    for (size_t j = 0; j < kDim; j++) {
-      x[j] = w_vec[j] * in_tmp[j];
-    }
-    for (size_t j = 0; j < kDim; j++) {
-      sum += x[j];
-    }
-    out[i] = sum;
-  }
+void MutmulVocab(Tensor1dLogits& out, const Tensor1d& in,
+                 const Tensor2dTokQ& w, const Tensor2dTokS& s) {
+  QuantizedMatmul(out, kVocabSize, in, kDim, &w[0][0], &s[0][0]);
 }
 
 // Compute the matrix multiplication of two input tensors.

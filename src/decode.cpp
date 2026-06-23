@@ -41,6 +41,15 @@ inline int ffn_a_idx(int layer, int row, int col) {
 inline int ffn_b_idx(int layer, int row, int col) {
   return (layer * kDim + row) * kFFNDim + col;
 }
+inline int attn_s_idx(int layer, int row, int group) {
+  return (layer * kDim + row) * kDimGroups + group;
+}
+inline int ffn_a_s_idx(int layer, int row, int group) {
+  return (layer * kFFNDim + row) * kDimGroups + group;
+}
+inline int ffn_b_s_idx(int layer, int row, int group) {
+  return (layer * kDim + row) * kFFNGroups + group;
+}
 inline int cache_idx(int layer, int pos, int i) {
   return (layer * kSeqLen + pos) * kDim + i;
 }
@@ -52,26 +61,40 @@ using namespace llama2;
 extern "C" {
 
 void kernel_decode(int token, int pos, const float* tok_emb_table,
-                   const float* rms_att_w, const float* attn_wq,
-                   const float* attn_wk, const float* attn_wv,
-                   const float* attn_wo, const float* rms_ffn_w,
-                   const float* ffn_w1, const float* ffn_w2,
-                   const float* ffn_w3, const float* rms_final,
-                   const float* cos_table, const float* sin_table,
-                   float* k_cache, float* v_cache, uint32_t* next_token) {
+                   const int8_t* tok_emb_q, const float* tok_emb_s,
+                   const float* rms_att_w, const int8_t* attn_wq,
+                   const float* attn_wq_s, const int8_t* attn_wk,
+                   const float* attn_wk_s, const int8_t* attn_wv,
+                   const float* attn_wv_s, const int8_t* attn_wo,
+                   const float* attn_wo_s, const float* rms_ffn_w,
+                   const int8_t* ffn_w1, const float* ffn_w1_s,
+                   const int8_t* ffn_w2, const float* ffn_w2_s,
+                   const int8_t* ffn_w3, const float* ffn_w3_s,
+                   const float* rms_final, const float* cos_table,
+                   const float* sin_table, float* k_cache, float* v_cache,
+                   uint32_t* next_token) {
 // -------------------------
 // Stage 0: AXI interfaces.
 // -------------------------
 #pragma HLS INTERFACE m_axi port = tok_emb_table bundle = gmem
+#pragma HLS INTERFACE m_axi port = tok_emb_q bundle = gmem
+#pragma HLS INTERFACE m_axi port = tok_emb_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = rms_att_w bundle = gmem
 #pragma HLS INTERFACE m_axi port = attn_wq bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wq_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = attn_wk bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wk_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = attn_wv bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wv_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = attn_wo bundle = gmem
+#pragma HLS INTERFACE m_axi port = attn_wo_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = rms_ffn_w bundle = gmem
 #pragma HLS INTERFACE m_axi port = ffn_w1 bundle = gmem
+#pragma HLS INTERFACE m_axi port = ffn_w1_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = ffn_w2 bundle = gmem
+#pragma HLS INTERFACE m_axi port = ffn_w2_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = ffn_w3 bundle = gmem
+#pragma HLS INTERFACE m_axi port = ffn_w3_s bundle = gmem
 #pragma HLS INTERFACE m_axi port = rms_final bundle = gmem
 #pragma HLS INTERFACE m_axi port = cos_table bundle = gmem
 #pragma HLS INTERFACE m_axi port = sin_table bundle = gmem
@@ -134,7 +157,8 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
         lm_head_task ? Task::LmHead : static_cast<Task>(layer_task);
 
     const float* linear_src = final_norm;
-    const float* linear_weight = tok_emb_table;
+    const int8_t* linear_weight_q = tok_emb_q;
+    const float* linear_weight_s = tok_emb_s;
     float* linear_dst = hidden;
     int linear_rows = kDim;
     int linear_cols = kDim;
@@ -147,7 +171,8 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
         best_token = 0;
       }
       linear_src = final_norm;
-      linear_weight = &tok_emb_table[vocab_base * kDim];
+      linear_weight_q = &tok_emb_q[vocab_base * kDim];
+      linear_weight_s = &tok_emb_s[vocab_base * kDimGroups];
       linear_dst = score_tile;
       linear_rows = kVocabTile;
       if (vocab_base + kVocabTile > kVocabSize) {
@@ -162,21 +187,24 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
       }
       kernel_rmsnorm(attn_norm, attn_input, &rms_att_w[rms_idx(layer, 0)]);
       linear_src = attn_norm;
-      linear_weight = &attn_wq[attn_idx(layer, 0, 0)];
+      linear_weight_q = &attn_wq[attn_idx(layer, 0, 0)];
+      linear_weight_s = &attn_wq_s[attn_s_idx(layer, 0, 0)];
       linear_dst = q;
       linear_rows = kDim;
       linear_cols = kDim;
       break;
     case Task::AttnK:
       linear_src = attn_norm;
-      linear_weight = &attn_wk[attn_idx(layer, 0, 0)];
+      linear_weight_q = &attn_wk[attn_idx(layer, 0, 0)];
+      linear_weight_s = &attn_wk_s[attn_s_idx(layer, 0, 0)];
       linear_dst = k;
       linear_rows = kDim;
       linear_cols = kDim;
       break;
     case Task::AttnV:
       linear_src = attn_norm;
-      linear_weight = &attn_wv[attn_idx(layer, 0, 0)];
+      linear_weight_q = &attn_wv[attn_idx(layer, 0, 0)];
+      linear_weight_s = &attn_wv_s[attn_s_idx(layer, 0, 0)];
       linear_dst = v;
       linear_rows = kDim;
       linear_cols = kDim;
@@ -218,7 +246,8 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
       }
 
       linear_src = attn_val;
-      linear_weight = &attn_wo[attn_idx(layer, 0, 0)];
+      linear_weight_q = &attn_wo[attn_idx(layer, 0, 0)];
+      linear_weight_s = &attn_wo_s[attn_s_idx(layer, 0, 0)];
       linear_dst = attn_out;
       linear_rows = kDim;
       linear_cols = kDim;
@@ -227,14 +256,16 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
       kernel_add(attn_res, attn_input, attn_out);
       kernel_rmsnorm(ffn_norm, attn_res, &rms_ffn_w[rms_idx(layer, 0)]);
       linear_src = ffn_norm;
-      linear_weight = &ffn_w1[ffn_a_idx(layer, 0, 0)];
+      linear_weight_q = &ffn_w1[ffn_a_idx(layer, 0, 0)];
+      linear_weight_s = &ffn_w1_s[ffn_a_s_idx(layer, 0, 0)];
       linear_dst = ffn_w1x;
       linear_rows = kFFNDim;
       linear_cols = kDim;
       break;
     case Task::FfnW3:
       linear_src = ffn_norm;
-      linear_weight = &ffn_w3[ffn_a_idx(layer, 0, 0)];
+      linear_weight_q = &ffn_w3[ffn_a_idx(layer, 0, 0)];
+      linear_weight_s = &ffn_w3_s[ffn_a_s_idx(layer, 0, 0)];
       linear_dst = ffn_w3x;
       linear_rows = kFFNDim;
       linear_cols = kDim;
@@ -243,7 +274,8 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
       kernel_silu(ffn_act, ffn_w1x);
       kernel_mul(ffn_dot, ffn_act, ffn_w3x);
       linear_src = ffn_dot;
-      linear_weight = &ffn_w2[ffn_b_idx(layer, 0, 0)];
+      linear_weight_q = &ffn_w2[ffn_b_idx(layer, 0, 0)];
+      linear_weight_s = &ffn_w2_s[ffn_b_s_idx(layer, 0, 0)];
       linear_dst = ffn_out;
       linear_rows = kDim;
       linear_cols = kFFNDim;
@@ -251,7 +283,7 @@ void kernel_decode(int token, int pos, const float* tok_emb_table,
     }
 
     kernel_matmul(linear_dst, linear_rows, linear_src, linear_cols,
-                  linear_weight);
+                  linear_weight_q, linear_weight_s);
 
     switch (task) {
     case Task::LmHead:
@@ -327,9 +359,12 @@ void Decode(int tok, int pos, const Tensor1d& ctx_input,
     }
 
     RMSNorm(ctx.attn_norm[i_layer], attn_input, w.rms_att_w[i_layer]);
-    Matmul(ctx.attn_wqx[i_layer], ctx.attn_norm[i_layer], w.attn_wq[i_layer]);
-    Matmul(ctx.attn_wkx[i_layer], ctx.attn_norm[i_layer], w.attn_wk[i_layer]);
-    Matmul(ctx.attn_wvx[i_layer], ctx.attn_norm[i_layer], w.attn_wv[i_layer]);
+    Matmul(ctx.attn_wqx[i_layer], ctx.attn_norm[i_layer], w.attn_wq[i_layer],
+           w.attn_wq_s[i_layer]);
+    Matmul(ctx.attn_wkx[i_layer], ctx.attn_norm[i_layer], w.attn_wk[i_layer],
+           w.attn_wk_s[i_layer]);
+    Matmul(ctx.attn_wvx[i_layer], ctx.attn_norm[i_layer], w.attn_wv[i_layer],
+           w.attn_wv_s[i_layer]);
 
     for (int head = 0; head < kNumHeads; ++head) {
       RoPE(ctx.attn_q_r[i_layer], ctx.attn_k_r[i_layer], ctx.attn_wqx[i_layer],
@@ -352,14 +387,18 @@ void Decode(int tok, int pos, const Tensor1d& ctx_input,
                             pos + 1);
     }
 
-    Matmul(ctx.attn_out[i_layer], ctx.attn_val[i_layer], w.attn_wo[i_layer]);
+    Matmul(ctx.attn_out[i_layer], ctx.attn_val[i_layer], w.attn_wo[i_layer],
+           w.attn_wo_s[i_layer]);
     Add(ctx.attn_res[i_layer], attn_input, ctx.attn_out[i_layer]);
     RMSNorm(ctx.ffn_norm[i_layer], ctx.attn_res[i_layer], w.rms_ffn_w[i_layer]);
-    Matmul(ctx.ffn_w1x[i_layer], ctx.ffn_norm[i_layer], w.ffn_w1[i_layer]);
-    Matmul(ctx.ffn_w3x[i_layer], ctx.ffn_norm[i_layer], w.ffn_w3[i_layer]);
+    Matmul(ctx.ffn_w1x[i_layer], ctx.ffn_norm[i_layer], w.ffn_w1[i_layer],
+           w.ffn_w1_s[i_layer]);
+    Matmul(ctx.ffn_w3x[i_layer], ctx.ffn_norm[i_layer], w.ffn_w3[i_layer],
+           w.ffn_w3_s[i_layer]);
     SiLU(ctx.ffn_act[i_layer], ctx.ffn_w1x[i_layer]);
     Mul(ctx.ffn_dot[i_layer], ctx.ffn_act[i_layer], ctx.ffn_w3x[i_layer]);
-    Matmul(ctx.ffn_out[i_layer], ctx.ffn_dot[i_layer], w.ffn_w2[i_layer]);
+    Matmul(ctx.ffn_out[i_layer], ctx.ffn_dot[i_layer], w.ffn_w2[i_layer],
+           w.ffn_w2_s[i_layer]);
     Add(ctx.ffn_res[i_layer], ctx.attn_res[i_layer], ctx.ffn_out[i_layer]);
   }
 

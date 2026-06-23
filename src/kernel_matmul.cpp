@@ -2,74 +2,136 @@
 
 #include "tensor.hpp"
 
+#include <math.h>
+
 namespace llama2 {
 
-constexpr int kLinearLanes = 16;
-constexpr int kLinearAccBanks = 16;
 constexpr int kLinearMaxIn = kFFNDim;
 constexpr int kLinearMaxOut = kFFNDim;
-typedef float MatmulWeightWord __attribute__((vector_size(64)));
+constexpr int kLinearMaxGroups = kFFNGroups;
+typedef int8_t MatmulWeightWord __attribute__((vector_size(32)));
 
 static void kernel_matmul(float* out, int out_size, const float* in,
-                          int in_size, const float* weight) {
+                          int in_size, const int8_t* weight_q,
+                          const float* weight_s) {
 #pragma HLS INLINE off
   // -------------------------
-  // Stage A: cache input vector.
+  // Stage A: quantize the input vector.
   // -------------------------
-  float in_cache[kLinearMaxIn];
-  float acc[kLinearAccBanks];
-  
-#pragma HLS ARRAY_PARTITION variable = in_cache cyclic factor = 16 dim = 1
-#pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
+  int8_t in_q[kLinearMaxIn];
+  float in_s[kLinearMaxGroups];
+  float weight_s_cache[kLinearMaxOut][kLinearMaxGroups];
 
-  for (int col = 0; col < in_size; ++col) {
+#pragma HLS ARRAY_PARTITION variable = in_q cyclic factor = 32 dim = 1
+#pragma HLS ARRAY_PARTITION variable = in_s complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = weight_s_cache complete dim = 2
+
+  const int group_count = in_size / kQuantGroupSize;
+
+  for (int group = 0; group < in_size / kQuantGroupSize; ++group) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < kQuantGroupSize; ++i) {
 #pragma HLS PIPELINE II = 1
-    in_cache[col] = in[col];
+      const float val = fabsf(in[group * kQuantGroupSize + i]);
+      if (val > max_abs) {
+        max_abs = val;
+      }
+    }
+
+    const float scale = max_abs / 127.0f;
+    in_s[group] = scale;
+    for (int i = 0; i < kQuantGroupSize; ++i) {
+#pragma HLS PIPELINE II = 1
+      const int col = group * kQuantGroupSize + i;
+      float q = scale == 0.0f ? 0.0f : nearbyintf(in[col] / scale);
+      if (q > 127.0f) {
+        q = 127.0f;
+      }
+      if (q < -127.0f) {
+        q = -127.0f;
+      }
+      in_q[col] = static_cast<int8_t>(q);
+    }
+  }
+
+  // -------------------------
+  // Stage B: cache weight scales on chip.
+  // -------------------------
+  for (int row = 0; row < out_size; ++row) {
+    for (int group = 0; group < group_count; ++group) {
+#pragma HLS PIPELINE II = 1
+      weight_s_cache[row][group] = weight_s[row * group_count + group];
+    }
   }
 
   const MatmulWeightWord* weight_words =
-      reinterpret_cast<const MatmulWeightWord*>(weight);
+      reinterpret_cast<const MatmulWeightWord*>(weight_q);
 
   // -------------------------
-  // Stage B: stream rows through 16 MAC lanes.
+  // Stage C: stream Q8 weights and keep dot products in int32.
   // -------------------------
   for (int row = 0; row < out_size; ++row) {
-    for (int lane = 0; lane < kLinearLanes; ++lane) {
-      #pragma HLS UNROLL
-            acc[lane] = 0.0f;
-          }
-      
-          for (int base = 0; base < in_size; base += kLinearLanes) {
-      #pragma HLS PIPELINE II = 1
-            const int weight_word_idx = (row * in_size + base) / kLinearLanes;
-            const MatmulWeightWord weight_vec = weight_words[weight_word_idx];
-      
-            for (int lane = 0; lane < kLinearLanes; ++lane) {
-      #pragma HLS UNROLL
-              const int col = base + lane;
-              acc[lane] += weight_vec[lane] * in_cache[col];
-            }
-          }
-      
-          // -------------------------
-          // Stage C: tree reduction and writeback.
-          // -------------------------
-          float sum01 = acc[0] + acc[1];
-          float sum23 = acc[2] + acc[3];
-          float sum45 = acc[4] + acc[5];
-          float sum67 = acc[6] + acc[7];
-          float sum89 = acc[8] + acc[9];
-          float sumab = acc[10] + acc[11];
-          float sumcd = acc[12] + acc[13];
-          float sumef = acc[14] + acc[15];
-          float sum03 = sum01 + sum23;
-          float sum47 = sum45 + sum67;
-          float sum8b = sum89 + sumab;
-          float sumcf = sumcd + sumef;
-          out[row] = (sum03 + sum47) + (sum8b + sumcf);
-        }
+    int32_t dot_group[kLinearMaxGroups];
+    float partial[kLinearMaxGroups];
+    float sum12[kLinearMaxGroups / 2];
+    float sum24[kLinearMaxGroups / 4];
+    float sum48[kLinearMaxGroups / 8];
+
+#pragma HLS ARRAY_PARTITION variable = dot_group complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = partial complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = sum12 complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = sum24 complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = sum48 complete dim = 1
+
+    for (int group = 0; group < kLinearMaxGroups; ++group) {
+#pragma HLS UNROLL
+      dot_group[group] = 0;
+    }
+
+    for (int group = 0; group < group_count; ++group) {
+#pragma HLS PIPELINE II = 1
+      const MatmulWeightWord weight_vec = weight_words[row * group_count + group];
+      int32_t dot = 0;
+
+      for (int lane = 0; lane < kQuantGroupSize; ++lane) {
+#pragma HLS UNROLL
+        const int col = group * kQuantGroupSize + lane;
+        dot += static_cast<int32_t>(in_q[col]) *
+               static_cast<int32_t>(weight_vec[lane]);
       }
-      
-      } // namespace llama2
-      
-      #endif // BUILD_DECODE_KERNEL
+
+      dot_group[group] = dot;
+    }
+
+    // -------------------------
+    // Stage D: dequantize and reduce the row result.
+    // -------------------------
+    for (int group = 0; group < kLinearMaxGroups; ++group) {
+#pragma HLS UNROLL
+      partial[group] =
+          group < group_count
+              ? static_cast<float>(dot_group[group]) * in_s[group] *
+                    weight_s_cache[row][group]
+              : 0.0f;
+    }
+
+    for (int i = 0; i < kLinearMaxGroups / 2; ++i) {
+#pragma HLS UNROLL
+      sum12[i] = partial[i * 2] + partial[i * 2 + 1];
+    }
+    for (int i = 0; i < kLinearMaxGroups / 4; ++i) {
+#pragma HLS UNROLL
+      sum24[i] = sum12[i * 2] + sum12[i * 2 + 1];
+    }
+    for (int i = 0; i < kLinearMaxGroups / 8; ++i) {
+#pragma HLS UNROLL
+      sum48[i] = sum24[i * 2] + sum24[i * 2 + 1];
+    }
+
+    out[row] = sum48[0] + sum48[1] + sum48[2];
+  }
+}
+
+} // namespace llama2
+
+#endif // BUILD_DECODE_KERNEL

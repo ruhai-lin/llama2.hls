@@ -2,6 +2,7 @@
 #define TENSOR_HPP_
 
 #include <string>
+#include <stdint.h>
 
 namespace llama2 {
 
@@ -14,19 +15,36 @@ constexpr int kSinCosTable = 24;
 constexpr int kSeqLen = 256;
 constexpr int kFFNDim = 768;
 constexpr int kHalvedHeadDim = (kDim / kNumLayers);
+constexpr int kQuantGroupSize = 32;
+constexpr int kDimGroups = kDim / kQuantGroupSize;
+constexpr int kFFNGroups = kFFNDim / kQuantGroupSize;
 
 using Tensor1d = float[kDim];
 using Tensor2dTok = float[kVocabSize][kDim];
+using Tensor2dTokQ = int8_t[kVocabSize][kDim];
+using Tensor2dTokS = float[kVocabSize][kDimGroups];
 using Tensor2dAttn = float[kDim][kDim];
 using Tensor3dAttn = float[kNumLayers][kDim][kDim];
+using Tensor2dAttnQ = int8_t[kDim][kDim];
+using Tensor3dAttnQ = int8_t[kNumLayers][kDim][kDim];
+using Tensor2dAttnS = float[kDim][kDimGroups];
+using Tensor3dAttnS = float[kNumLayers][kDim][kDimGroups];
 using Tensor2dRMS = float[kNumLayers][kDim];
 using Tensor1dSinCos = float[kSinCosTable];
 using Tensor2dSinCos = float[kSeqLen][kSinCosTable];
 using Tensor2dFFNA = float[kFFNDim][kDim];
 using Tensor3dFFNA = float[kNumLayers][kFFNDim][kDim];
+using Tensor2dFFNAQ = int8_t[kFFNDim][kDim];
+using Tensor3dFFNAQ = int8_t[kNumLayers][kFFNDim][kDim];
+using Tensor2dFFNAS = float[kFFNDim][kDimGroups];
+using Tensor3dFFNAS = float[kNumLayers][kFFNDim][kDimGroups];
 using Tensor1dFFNB = float[kFFNDim];
 using Tensor2dFFNB = float[kDim][kFFNDim];
 using Tensor3dFFNB = float[kNumLayers][kDim][kFFNDim];
+using Tensor2dFFNBQ = int8_t[kDim][kFFNDim];
+using Tensor3dFFNBQ = int8_t[kNumLayers][kDim][kFFNDim];
+using Tensor2dFFNBS = float[kDim][kFFNGroups];
+using Tensor3dFFNBS = float[kNumLayers][kDim][kFFNGroups];
 using Tensor1dQKSM = float[kSeqLen];
 using Tensor2dQKSM = float[kNumLayers][kSeqLen];
 using Tensor2dFFNC = float[kNumLayers][kFFNDim];
@@ -51,15 +69,19 @@ void Sub(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs);
 void Div(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs);
 
 float InnerProduct(const Tensor1d& lhs, const Tensor1d& rhs);
-void Matmul(Tensor1d& out, const Tensor1d& in, const Tensor2dAttn& w);
+void Matmul(Tensor1d& out, const Tensor1d& in, const Tensor2dAttnQ& w,
+            const Tensor2dAttnS& s);
 void MutmulRanged(Tensor1dQKSM& out, const Tensor1d& in, const Tensor2dCache& w,
                   int i_begin, int i_end, int j_begin, int j_end);
 void MutmulRangedTranspose(Tensor1d& out, const Tensor1dQKSM& in,
                            const Tensor2dCache& w, int i_begin, int i_end,
                            int j_begin, int j_end);
-void Matmul(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNA& w);
-void Matmul(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNB& w);
-void MutmulVocab(Tensor1dLogits& out, const Tensor1d& in, const Tensor2dTok& w);
+void Matmul(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNAQ& w,
+            const Tensor2dFFNAS& s);
+void Matmul(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNBQ& w,
+            const Tensor2dFFNBS& s);
+void MutmulVocab(Tensor1dLogits& out, const Tensor1d& in,
+                 const Tensor2dTokQ& w, const Tensor2dTokS& s);
 
 void ReLU(Tensor1d& out, const Tensor1d& in);
 void SiLU(Tensor1dFFNB& out, const Tensor1dFFNB& in);
