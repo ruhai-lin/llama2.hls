@@ -4,13 +4,8 @@
 #include "context.hpp"
 #include "weight.hpp"
 
-#include <stdint.h>
-
 #ifndef USE_CPU_ONLY
-#define CL_HPP_CL_1_2_DEFAULT_BUILD
-#define CL_HPP_TARGET_OPENCL_VERSION 120
-#define CL_HPP_MINIMUM_OPENCL_VERSION 120
-#define CL_HPP_ENABLE_PROGRAM_CONSTRUCTION_FROM_ARRAY_COMPATIBILITY 1
+#include "tensor_fpga.hpp"
 
 #include <CL/cl2.hpp>
 #endif // USE_CPU_ONLY
@@ -19,13 +14,16 @@ namespace llama2 {
 
 void Decode(int tok, int pos, const Tensor1d& ctx_input,
             Tensor3dCache& ctx_k_cache, Tensor3dCache& ctx_v_cache,
-            Tensor1d& ctx_final_norm, Tensor1dLogits& ctx_logits,
-            int& next_token,
-            const Weights& w
+            Tensor1d& ctx_final_norm, const Weights& w
 #ifndef USE_CPU_ONLY
             ,
-            cl::CommandQueue q, cl::Kernel kernel_decode, uint32_t* ptr_next,
-            cl::Buffer buffer_next
+            cl::CommandQueue q, cl::Kernel kernel_matmul, cl::Kernel kernel_mul,
+            cl::Kernel kernel_rmsnorm, cl::Kernel kernel_softmax,
+            cl::Kernel kernel_add, cl::Kernel kernel_rope, float* ptr_a,
+            float* ptr_b, float* ptr_c, float* ptr_d, float* ptr_result,
+            float* ptr_result2, cl::Buffer buffer_a, cl::Buffer buffer_b,
+            cl::Buffer buffer_c, cl::Buffer buffer_d, cl::Buffer buffer_result,
+            cl::Buffer buffer_result2
 #endif // USE_CPU_ONLY
 );
 

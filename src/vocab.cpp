@@ -1,6 +1,5 @@
 #include "vocab.hpp"
 
-#include <cstdio>
 #include <stdexcept>
 
 namespace llama2 {
@@ -8,9 +7,6 @@ namespace llama2 {
 // ResizeVocab resizes the vocab to the given size.
 void ResizeVocab(Vocab& vocab, int vocab_size) {
   vocab.dict.resize(vocab_size);
-  for (size_t i = 0; i < vocab.byte_pieces.size(); i++) {
-    vocab.byte_pieces.at(i) = std::string(1, static_cast<char>(i));
-  }
 }
 
 // LoadVocab loads llama2.c tokenizer.bin:
@@ -36,23 +32,9 @@ void LoadVocab(Vocab& vocab, std::ifstream& fs) {
     if (!fs) {
       throw std::runtime_error("failed to read tokenizer token bytes");
     }
+    piece.push_back('\0');
     vocab.dict.at(i) = std::move(piece);
   }
-}
-
-std::string DecodePiece(const Vocab& vocab, int prev_token, int token) {
-  std::string piece = vocab.dict.at(token);
-  if (prev_token == 1 && !piece.empty() && piece.front() == ' ') {
-    piece.erase(piece.begin());
-  }
-
-  unsigned int byte_val;
-  if (std::sscanf(piece.c_str(), "<0x%02X>", &byte_val) == 1 &&
-      byte_val < vocab.byte_pieces.size()) {
-    return vocab.byte_pieces.at(byte_val);
-  }
-
-  return piece;
 }
 
 } // namespace llama2

@@ -1,10 +1,8 @@
 #include <cstring>
-#include <chrono>
-#include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <random>
 #include <utility>
-#include <vector>
 
 #include "context.hpp"
 #include "decode.hpp"
@@ -13,11 +11,6 @@
 
 #ifndef USE_CPU_ONLY
 #include <stdlib.h>
-
-#define CL_HPP_CL_1_2_DEFAULT_BUILD
-#define CL_HPP_TARGET_OPENCL_VERSION 120
-#define CL_HPP_MINIMUM_OPENCL_VERSION 120
-#define CL_HPP_ENABLE_PROGRAM_CONSTRUCTION_FROM_ARRAY_COMPATIBILITY 1
 
 #include <CL/cl2.hpp>
 
@@ -28,6 +21,8 @@
            __LINE__, error);                                               \
     exit(EXIT_FAILURE);                                                    \
   }
+
+static const int MAX_DATA_SIZE = 1024;
 
 template <typename T>
 struct aligned_allocator {
@@ -40,25 +35,6 @@ struct aligned_allocator {
   }
   void deallocate(T* p, std::size_t num) { free(p); }
 };
-
-template <typename T>
-std::vector<float, aligned_allocator<float>> FlattenWeights(const T& data,
-                                                            std::size_t count) {
-  std::vector<float, aligned_allocator<float>> flat(count);
-  std::memcpy(flat.data(), reinterpret_cast<const float*>(&data),
-              count * sizeof(float));
-  return flat;
-}
-
-template <typename T>
-cl::Buffer CreateKernelArgBuffer(const cl::Context& context,
-                                 const cl::Kernel& kernel, unsigned int argidx,
-                                 cl_mem_flags flags, std::size_t bytes,
-                                 T* host_ptr, cl_int* err) {
-  (void)kernel;
-  (void)argidx;
-  return cl::Buffer(context, flags | CL_MEM_USE_HOST_PTR, bytes, host_ptr, err);
-}
 #endif // USE_CPU_ONLY
 
 // Command line arguments.
@@ -176,41 +152,18 @@ int main(int argc, char* argv[]) {
   // 5. OpenCL Settings
   std::string xclbinFilename = "./binary_container_1.bin";
 
-  constexpr std::size_t tok_emb_count = llama2::kVocabSize * llama2::kDim;
-  constexpr std::size_t rms_count = llama2::kNumLayers * llama2::kDim;
-  constexpr std::size_t attn_count =
-      llama2::kNumLayers * llama2::kDim * llama2::kDim;
-  constexpr std::size_t ffn_a_count =
-      llama2::kNumLayers * llama2::kFFNDim * llama2::kDim;
-  constexpr std::size_t ffn_b_count =
-      llama2::kNumLayers * llama2::kDim * llama2::kFFNDim;
-  constexpr std::size_t rms_final_count = llama2::kDim;
-  constexpr std::size_t sincos_count = llama2::kSeqLen * llama2::kSinCosTable;
-  constexpr std::size_t cache_count =
-      llama2::kNumLayers * llama2::kSeqLen * llama2::kDim;
-
-  auto tok_emb_host = FlattenWeights(tok_emb_table, tok_emb_count);
-  auto rms_att_host = FlattenWeights(weights.rms_att_w, rms_count);
-  auto attn_wq_host = FlattenWeights(weights.attn_wq, attn_count);
-  auto attn_wk_host = FlattenWeights(weights.attn_wk, attn_count);
-  auto attn_wv_host = FlattenWeights(weights.attn_wv, attn_count);
-  auto attn_wo_host = FlattenWeights(weights.attn_wo, attn_count);
-  auto rms_ffn_host = FlattenWeights(weights.rms_ffn_w, rms_count);
-  auto ffn_w1_host = FlattenWeights(weights.ffn_w1, ffn_a_count);
-  auto ffn_w2_host = FlattenWeights(weights.ffn_w2, ffn_b_count);
-  auto ffn_w3_host = FlattenWeights(weights.ffn_w3, ffn_a_count);
-  auto rms_final_host = FlattenWeights(weights.rms_final, rms_final_count);
-  auto cos_host = FlattenWeights(weights.cos_table, sincos_count);
-  auto sin_host = FlattenWeights(weights.sin_table, sincos_count);
-  std::vector<float, aligned_allocator<float>> k_cache_host(cache_count, 0.0f);
-  std::vector<float, aligned_allocator<float>> v_cache_host(cache_count, 0.0f);
-  std::vector<uint32_t, aligned_allocator<uint32_t>> next_host(1, 0);
+  size_t size_in_bytes = MAX_DATA_SIZE * sizeof(float);
 
   std::vector<cl::Device> devices;
   cl_int err;
   cl::Context context;
   cl::CommandQueue q;
-  cl::Kernel kernel_decode;
+  cl::Kernel kernel_matmul;
+  cl::Kernel kernel_mul;
+  cl::Kernel kernel_rmsnorm;
+  cl::Kernel kernel_softmax;
+  cl::Kernel kernel_add;
+  cl::Kernel kernel_rope;
   cl::Program program;
   std::vector<cl::Platform> platforms;
   bool found_device = false;
@@ -270,8 +223,20 @@ int main(int argc, char* argv[]) {
     } else {
       std::cout << "Device[" << i << "]: program successful!\n";
       OCL_CHECK(err,
-                kernel_decode = cl::Kernel(program, "kernel_decode", &err));
-      std::cout << "load : kernel_decode" << std::endl;
+                kernel_matmul = cl::Kernel(program, "kernel_matmul", &err));
+      std::cout << "load : kernel_matmul" << std::endl;
+      OCL_CHECK(err, kernel_mul = cl::Kernel(program, "kernel_mul", &err));
+      std::cout << "load : kernel_mul" << std::endl;
+      OCL_CHECK(err,
+                kernel_rmsnorm = cl::Kernel(program, "kernel_rmsnorm", &err));
+      std::cout << "load : kernel_rmsnorm" << std::endl;
+      OCL_CHECK(err,
+                kernel_softmax = cl::Kernel(program, "kernel_softmax", &err));
+      std::cout << "load : kernel_softmax" << std::endl;
+      OCL_CHECK(err, kernel_add = cl::Kernel(program, "kernel_add", &err));
+      std::cout << "load : kernel_add" << std::endl;
+      OCL_CHECK(err, kernel_rope = cl::Kernel(program, "kernel_rope", &err));
+      std::cout << "load : kernel_rope" << std::endl;
       valid_device = true;
       break; // we break because we found a valid device
     }
@@ -281,82 +246,77 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  OCL_CHECK(err, cl::Buffer buffer_tok_emb = CreateKernelArgBuffer(
-                     context, kernel_decode, 2, CL_MEM_READ_ONLY,
-                     tok_emb_count * sizeof(float), tok_emb_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_rms_att = CreateKernelArgBuffer(
-                     context, kernel_decode, 3, CL_MEM_READ_ONLY,
-                     rms_count * sizeof(float), rms_att_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wq = CreateKernelArgBuffer(
-                     context, kernel_decode, 4, CL_MEM_READ_ONLY,
-                     attn_count * sizeof(float), attn_wq_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wk = CreateKernelArgBuffer(
-                     context, kernel_decode, 5, CL_MEM_READ_ONLY,
-                     attn_count * sizeof(float), attn_wk_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wv = CreateKernelArgBuffer(
-                     context, kernel_decode, 6, CL_MEM_READ_ONLY,
-                     attn_count * sizeof(float), attn_wv_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_attn_wo = CreateKernelArgBuffer(
-                     context, kernel_decode, 7, CL_MEM_READ_ONLY,
-                     attn_count * sizeof(float), attn_wo_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_rms_ffn = CreateKernelArgBuffer(
-                     context, kernel_decode, 8, CL_MEM_READ_ONLY,
-                     rms_count * sizeof(float), rms_ffn_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_ffn_w1 = CreateKernelArgBuffer(
-                     context, kernel_decode, 9, CL_MEM_READ_ONLY,
-                     ffn_a_count * sizeof(float), ffn_w1_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_ffn_w2 = CreateKernelArgBuffer(
-                     context, kernel_decode, 10, CL_MEM_READ_ONLY,
-                     ffn_b_count * sizeof(float), ffn_w2_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_ffn_w3 = CreateKernelArgBuffer(
-                     context, kernel_decode, 11, CL_MEM_READ_ONLY,
-                     ffn_a_count * sizeof(float), ffn_w3_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_rms_final = CreateKernelArgBuffer(
-                     context, kernel_decode, 12, CL_MEM_READ_ONLY,
-                     rms_final_count * sizeof(float), rms_final_host.data(),
-                     &err));
-  OCL_CHECK(err, cl::Buffer buffer_cos = CreateKernelArgBuffer(
-                     context, kernel_decode, 13, CL_MEM_READ_ONLY,
-                     sincos_count * sizeof(float), cos_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_sin = CreateKernelArgBuffer(
-                     context, kernel_decode, 14, CL_MEM_READ_ONLY,
-                     sincos_count * sizeof(float), sin_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_k_cache = CreateKernelArgBuffer(
-                     context, kernel_decode, 15, CL_MEM_READ_WRITE,
-                     cache_count * sizeof(float), k_cache_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_v_cache = CreateKernelArgBuffer(
-                     context, kernel_decode, 16, CL_MEM_READ_WRITE,
-                     cache_count * sizeof(float), v_cache_host.data(), &err));
-  OCL_CHECK(err, cl::Buffer buffer_next = CreateKernelArgBuffer(
-                     context, kernel_decode, 17, CL_MEM_WRITE_ONLY,
-                     sizeof(uint32_t), next_host.data(), &err));
-
-  OCL_CHECK(err, err = kernel_decode.setArg(2, buffer_tok_emb));
-  OCL_CHECK(err, err = kernel_decode.setArg(3, buffer_rms_att));
-  OCL_CHECK(err, err = kernel_decode.setArg(4, buffer_attn_wq));
-  OCL_CHECK(err, err = kernel_decode.setArg(5, buffer_attn_wk));
-  OCL_CHECK(err, err = kernel_decode.setArg(6, buffer_attn_wv));
-  OCL_CHECK(err, err = kernel_decode.setArg(7, buffer_attn_wo));
-  OCL_CHECK(err, err = kernel_decode.setArg(8, buffer_rms_ffn));
-  OCL_CHECK(err, err = kernel_decode.setArg(9, buffer_ffn_w1));
-  OCL_CHECK(err, err = kernel_decode.setArg(10, buffer_ffn_w2));
-  OCL_CHECK(err, err = kernel_decode.setArg(11, buffer_ffn_w3));
-  OCL_CHECK(err, err = kernel_decode.setArg(12, buffer_rms_final));
-  OCL_CHECK(err, err = kernel_decode.setArg(13, buffer_cos));
-  OCL_CHECK(err, err = kernel_decode.setArg(14, buffer_sin));
-  OCL_CHECK(err, err = kernel_decode.setArg(15, buffer_k_cache));
-  OCL_CHECK(err, err = kernel_decode.setArg(16, buffer_v_cache));
-  OCL_CHECK(err, err = kernel_decode.setArg(17, buffer_next));
-
+  // These commands will allocate memory on the Device. The cl::Buffer objects
+  // can be used to reference the memory locations on the device.
+  OCL_CHECK(err, cl::Buffer buffer_a(context, CL_MEM_READ_ONLY, size_in_bytes,
+                                     NULL, &err));
   OCL_CHECK(err,
-            err = q.enqueueMigrateMemObjects(
-                {buffer_tok_emb, buffer_rms_att, buffer_attn_wq,
-                 buffer_attn_wk, buffer_attn_wv, buffer_attn_wo,
-                 buffer_rms_ffn, buffer_ffn_w1, buffer_ffn_w2, buffer_ffn_w3,
-                 buffer_rms_final, buffer_cos, buffer_sin, buffer_k_cache,
-                 buffer_v_cache},
-                0));
-  OCL_CHECK(err, err = q.finish());
+            cl::Buffer buffer_b(context, CL_MEM_READ_ONLY,
+                                size_in_bytes * size_in_bytes, NULL, &err));
+  OCL_CHECK(err, cl::Buffer buffer_c(context, CL_MEM_READ_ONLY, size_in_bytes,
+                                     NULL, &err));
+  OCL_CHECK(err, cl::Buffer buffer_d(context, CL_MEM_READ_ONLY, size_in_bytes,
+                                     NULL, &err));
+  OCL_CHECK(err, cl::Buffer buffer_result(context, CL_MEM_WRITE_ONLY,
+                                          size_in_bytes, NULL, &err));
+  OCL_CHECK(err, cl::Buffer buffer_result2(context, CL_MEM_WRITE_ONLY,
+                                           size_in_bytes, NULL, &err));
+
+  // set the kernel Arguments
+  OCL_CHECK(err, err = kernel_rmsnorm.setArg(0, buffer_a));
+  OCL_CHECK(err, err = kernel_rmsnorm.setArg(1, buffer_b));
+  OCL_CHECK(err, err = kernel_rmsnorm.setArg(2, buffer_result));
+
+  OCL_CHECK(err, err = kernel_matmul.setArg(0, buffer_a));
+  OCL_CHECK(err, err = kernel_matmul.setArg(1, buffer_b));
+  OCL_CHECK(err, err = kernel_matmul.setArg(2, buffer_result));
+  OCL_CHECK(err, err = kernel_matmul.setArg(3, llama2::kDim));
+  OCL_CHECK(err, err = kernel_matmul.setArg(4, llama2::kDim));
+
+  OCL_CHECK(err, err = kernel_mul.setArg(0, buffer_a));
+  OCL_CHECK(err, err = kernel_mul.setArg(1, buffer_b));
+  OCL_CHECK(err, err = kernel_mul.setArg(2, buffer_result));
+
+  OCL_CHECK(err, err = kernel_add.setArg(0, buffer_a));
+  OCL_CHECK(err, err = kernel_add.setArg(1, buffer_b));
+  OCL_CHECK(err, err = kernel_add.setArg(2, buffer_result));
+
+  OCL_CHECK(err, err = kernel_softmax.setArg(0, buffer_a));
+  OCL_CHECK(err, err = kernel_softmax.setArg(1, buffer_result));
+
+  OCL_CHECK(err, err = kernel_rope.setArg(0, buffer_a));
+  OCL_CHECK(err, err = kernel_rope.setArg(1, buffer_b));
+  OCL_CHECK(err, err = kernel_rope.setArg(2, buffer_c));
+  OCL_CHECK(err, err = kernel_rope.setArg(3, buffer_d));
+  OCL_CHECK(err, err = kernel_rope.setArg(4, buffer_result));
+  OCL_CHECK(err, err = kernel_rope.setArg(5, buffer_result2));
+  OCL_CHECK(err, err = kernel_rope.setArg(6, 1));
+
+  // We then need to map our OpenCL buffer5 to get the pointers
+  float* ptr_a;
+  float* ptr_b;
+  float* ptr_c;
+  float* ptr_d;
+  float* ptr_result;
+  float* ptr_result2;
+  OCL_CHECK(err, ptr_a = (float*)q.enqueueMapBuffer(
+                     buffer_a, CL_TRUE, CL_MAP_WRITE, 0, size_in_bytes, NULL,
+                     NULL, &err));
+  OCL_CHECK(err, ptr_b = (float*)q.enqueueMapBuffer(
+                     buffer_b, CL_TRUE, CL_MAP_WRITE, 0,
+                     size_in_bytes * size_in_bytes, NULL, NULL, &err));
+  OCL_CHECK(err, ptr_c = (float*)q.enqueueMapBuffer(
+                     buffer_c, CL_TRUE, CL_MAP_WRITE, 0, size_in_bytes, NULL,
+                     NULL, &err));
+  OCL_CHECK(err, ptr_d = (float*)q.enqueueMapBuffer(
+                     buffer_d, CL_TRUE, CL_MAP_WRITE, 0, size_in_bytes, NULL,
+                     NULL, &err));
+  OCL_CHECK(err, ptr_result = (float*)q.enqueueMapBuffer(
+                     buffer_result, CL_TRUE, CL_MAP_READ, 0, size_in_bytes,
+                     NULL, NULL, &err));
+  OCL_CHECK(err, ptr_result2 = (float*)q.enqueueMapBuffer(
+                     buffer_result2, CL_TRUE, CL_MAP_READ, 0, size_in_bytes,
+                     NULL, NULL, &err));
 #endif // USE_CPU_ONLY
 
   // 6. Decode
@@ -367,39 +327,30 @@ int main(int argc, char* argv[]) {
   llama2::Tensor1dLogits ctx_logits;
   llama2::Tensor1d ctx_final_norm;
 
-  auto start_clk = std::chrono::steady_clock::now();
+  clock_t start_clk = clock();
 
   int next;
   int token = 1; // BOS (Begin of Sequence)
-
-#ifndef USE_CPU_ONLY
-  if (args.temp >= 1e-5) {
-    std::cerr << "[ERROR] FPGA build returns exact argmax token only; use "
-                 "--temp 0 for now."
-              << std::endl;
-    return EXIT_FAILURE;
-  }
-#endif // USE_CPU_ONLY
 
   for (int pos = 0; pos < args.max_seq; ++pos) {
 
     // 6-1. Load the context input and decode the next token.
     llama2::CopyTensor1d(ctx_input, tok_emb_table[token]);
     llama2::Decode(token, pos, ctx_input, ctx_k_cache, ctx_v_cache,
-                 ctx_final_norm, ctx_logits, next, weights
+                 ctx_final_norm, weights
 #ifndef USE_CPU_ONLY
                  ,
-                 q, kernel_decode, next_host.data(), buffer_next
+                 q, kernel_matmul, kernel_mul, kernel_rmsnorm, kernel_softmax,
+                 kernel_add, kernel_rope, ptr_a, ptr_b, ptr_c, ptr_d,
+                 ptr_result, ptr_result2, buffer_a, buffer_b, buffer_c,
+                 buffer_d, buffer_result, buffer_result2
 #endif // USE_CPU_ONLY
     );
 
-#ifdef USE_CPU_ONLY
     // 6-2. Calculate the logits and softmax.
     llama2::MutmulVocab(ctx_logits, ctx_final_norm, tok_emb_table);
-#endif // USE_CPU_ONLY
 
     if (args.print_softmax) {
-#ifdef USE_CPU_ONLY
       printf("\nSoftmax\n <- ");
       for (int i = 0; i <= pos; ++i)
         printf("%5.4f, ", ctx.attn_qk[0][i]);
@@ -407,13 +358,9 @@ int main(int argc, char* argv[]) {
       for (int i = 0; i <= pos; ++i)
         printf("%5.4f, ", ctx.attn_sm[0][i]);
       printf("\n");
-#else
-      std::cerr << "--print_softmax is only available in CPU-only builds.\n";
-#endif
     }
 
     // 6-3. Sampling the next token.
-#ifdef USE_CPU_ONLY
     if (args.temp < 1e-5) {
       next = llama2::Argmax(ctx_logits);
     } else {
@@ -423,25 +370,14 @@ int main(int argc, char* argv[]) {
       llama2::Softmax(ctx_logits, ctx_logits);
       next = SelectFromLogits(ctx_logits);
     }
-#endif // USE_CPU_ONLY
 
-    const std::string piece = llama2::DecodePiece(vocab, token, next);
-    if (args.color) {
-      std::cout << "\e[31m";
-      std::cout.write(piece.data(), piece.size());
-      std::cout << "\e[0m";
-    } else {
-      std::cout.write(piece.data(), piece.size());
-    }
+    args.color ? printf("\e[31m%s\e[0m", vocab.dict.at(next).data())
+               : printf("%s", vocab.dict.at(next).data());
     std::cout << std::flush;
 
     // Dump the contexts.
     if (args.log) {
-#ifdef USE_CPU_ONLY
       DumpContext("log/" + std::to_string(pos) + "_", ctx, llama2::kNumLayers);
-#else
-      std::cerr << "--log is only available in CPU-only builds.\n";
-#endif
     }
 
     token = next;
@@ -449,17 +385,23 @@ int main(int argc, char* argv[]) {
   std::cout << "\n";
 
   // 7. Print the time and speed.
-  auto end_clk = std::chrono::steady_clock::now();
-  double decode_time =
-      std::chrono::duration<double>(end_clk - start_clk).count();
+  clock_t end_clk = clock();
+  double decode_time = (double)(end_clk - start_clk) / CLOCKS_PER_SEC;
   std::cout << "Time : " << decode_time << "[s]" << std::endl
             << "Speed: " << args.max_seq / decode_time << "[tok/s]"
             << std::endl;
 
 #ifndef USE_CPU_ONLY
-  // 8. Flush OpenCL commands.
+  // 8. Flush OpenCL Device Memory
+  OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_a, ptr_a));
+  OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_b, ptr_b));
+  OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_c, ptr_c));
+  OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_d, ptr_d));
+  OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_result, ptr_result));
+  OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_result2, ptr_result2));
   OCL_CHECK(err, err = q.finish());
-  delete[] buf;
+  std::fflush(nullptr);
+  _Exit(EXIT_SUCCESS);
 #endif // USE_CPU_ONLY
 
   return 0;

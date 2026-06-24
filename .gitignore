@@ -3,3 +3,5 @@
 outputs/
 xcd.log
 model/stories15M.bin
+model/stories15M.pt
+analyzer_input/
