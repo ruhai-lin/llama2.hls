@@ -26,10 +26,10 @@ struct Context {
 
   // FFN
   Tensor2dRMS ffn_norm; // [layer, dim]
-  Tensor2dFFNC ffn_w1x; // [layer, ffn_dim]
-  Tensor2dFFNC ffn_w3x; // [layer, ffn_dim]
-  Tensor2dFFNC ffn_act; // [layer, ffn_dim]
-  Tensor2dFFNC ffn_dot; // [layer, ffn_dim]
+  Tensor2dFFNC ffn_w1x; // [layer, hidden_dim]
+  Tensor2dFFNC ffn_w3x; // [layer, hidden_dim]
+  Tensor2dFFNC ffn_act; // [layer, hidden_dim]
+  Tensor2dFFNC ffn_dot; // [layer, hidden_dim]
   Tensor2dRMS ffn_out;  // [layer, dim]
   Tensor2dRMS ffn_res;  // [layer, dim]
 

@@ -11,57 +11,82 @@
 #include <CL/cl2.hpp>
 
 #include "tensor.hpp"
+#include "weight.hpp"
 
 namespace llama2 {
 
-void AddFPGA(Tensor1d& out, const Tensor1d& in, float a, cl::CommandQueue q,
-             cl::Kernel kernel_add, float* ptr_a, float* ptr_b,
-             float* ptr_result, cl::Buffer buffer_a, cl::Buffer buffer_b,
-             cl::Buffer buffer_result);
-void MulFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, float a,
-             cl::CommandQueue q, cl::Kernel kernel_mul, float* ptr_a,
-             float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-             cl::Buffer buffer_b, cl::Buffer buffer_result);
+constexpr int kVocabTile = 1024;
+
+struct DeviceWeights {
+  cl::Buffer rms_att_w[kNLayers];
+  cl::Buffer attn_wq[kNLayers];
+  cl::Buffer attn_wk[kNLayers];
+  cl::Buffer attn_wv[kNLayers];
+  cl::Buffer attn_wo[kNLayers];
+
+  cl::Buffer rms_ffn_w[kNLayers];
+  cl::Buffer ffn_w1[kNLayers];
+  cl::Buffer ffn_w2[kNLayers];
+  cl::Buffer ffn_w3[kNLayers];
+
+  cl::Buffer rms_final;
+  cl::Buffer lm_head[(kVocabSize + kVocabTile - 1) / kVocabTile];
+  int lm_head_rows[(kVocabSize + kVocabTile - 1) / kVocabTile];
+};
+
+struct FPGA {
+  cl::CommandQueue q;
+
+  cl::Kernel kernel_matmul;
+  cl::Kernel kernel_mul;
+  cl::Kernel kernel_rmsnorm;
+  cl::Kernel kernel_softmax;
+  cl::Kernel kernel_add;
+  cl::Kernel kernel_rope;
+
+  float* ptr_a;
+  float* ptr_b;
+  float* ptr_c;
+  float* ptr_d;
+  float* ptr_result;
+  float* ptr_result2;
+
+  cl::Buffer buffer_a;
+  cl::Buffer buffer_b;
+  cl::Buffer buffer_c;
+  cl::Buffer buffer_d;
+  cl::Buffer buffer_result;
+  cl::Buffer buffer_result2;
+
+  DeviceWeights weights;
+};
+
+void UploadDeviceWeights(DeviceWeights& out, const Weights& w,
+                         const Tensor2dTok& tok_emb_table,
+                         cl::Context context, cl::CommandQueue q);
 
 void AddFPGA(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs,
-             cl::CommandQueue q, cl::Kernel kernel_add, float* ptr_a,
-             float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-             cl::Buffer buffer_b, cl::Buffer buffer_result);
+             FPGA& fpga);
+void MulFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, float a, FPGA& fpga);
 void MulFPGA(Tensor1dFFNB& out, const Tensor1dFFNB& lhs,
-             const Tensor1dFFNB& rhs, cl::CommandQueue q, cl::Kernel kernel_mul,
-             float* ptr_a, float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-             cl::Buffer buffer_b, cl::Buffer buffer_result);
+             const Tensor1dFFNB& rhs, FPGA& fpga);
 
-void MatmulFPGA(Tensor1d& out, const Tensor1d& in, const Tensor2dAttn& w,
-                cl::CommandQueue q, cl::Kernel kernel_matmul, float* ptr_a,
-                float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                cl::Buffer buffer_b, cl::Buffer buffer_result);
-void MatmulFPGA(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNA& w,
-                cl::CommandQueue q, cl::Kernel kernel_matmul, float* ptr_a,
-                float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                cl::Buffer buffer_b, cl::Buffer buffer_result);
-void MatmulFPGA(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNB& w,
-                cl::CommandQueue q, cl::Kernel kernel_matmul, float* ptr_a,
-                float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                cl::Buffer buffer_b, cl::Buffer buffer_result);
+void MatmulFPGA(Tensor1d& out, const Tensor1d& in, cl::Buffer weight_buffer,
+                FPGA& fpga);
+void MatmulFPGA(Tensor1dFFNB& out, const Tensor1d& in,
+                cl::Buffer weight_buffer, FPGA& fpga);
+void MatmulFPGA(Tensor1d& out, const Tensor1dFFNB& in,
+                cl::Buffer weight_buffer, FPGA& fpga);
+void LmHeadFPGA(Tensor1dLogits& out, const Tensor1d& in, FPGA& fpga);
 
-void RMSNormFPGA(Tensor1d& out, const Tensor1d& in, const Tensor1d& w,
-                 cl::CommandQueue q, cl::Kernel kernel_rmsnorm, float* ptr_a,
-                 float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                 cl::Buffer buffer_b, cl::Buffer buffer_result);
+void RMSNormFPGA(Tensor1d& out, const Tensor1d& in, cl::Buffer weight_buffer,
+                 FPGA& fpga);
 void SoftmaxFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, int max_pos,
-                 cl::CommandQueue q, cl::Kernel kernel_softmax, float* ptr_a,
-                 float* ptr_result, cl::Buffer buffer_a,
-                 cl::Buffer buffer_result);
+                 FPGA& fpga);
 
 void RoPEFPGA(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in,
               const Tensor1d& k_in, const Tensor1dSinCos& cos_vec,
-              const Tensor1dSinCos& sin_vec, int head_begin, int head_size,
-              cl::CommandQueue q, cl::Kernel kernel_rope, float* ptr_a,
-              float* ptr_b, float* ptr_c, float* ptr_d, float* ptr_result,
-              float* ptr_result2, cl::Buffer buffer_a, cl::Buffer buffer_b,
-              cl::Buffer buffer_c, cl::Buffer buffer_d,
-              cl::Buffer buffer_result, cl::Buffer buffer_result2);
+              const Tensor1dSinCos& sin_vec, int head_begin, FPGA& fpga);
 
 } // namespace llama2
 

@@ -2,95 +2,152 @@
 
 #ifndef USE_CPU_ONLY
 
+#include <algorithm>
+
 namespace llama2 {
+
+namespace {
+
+cl::Buffer UploadReadOnly(cl::Context context, cl::CommandQueue q,
+                          const float* data, size_t count) {
+  cl::Buffer buffer(context, CL_MEM_READ_ONLY, count * sizeof(float));
+  q.enqueueWriteBuffer(buffer, CL_TRUE, 0, count * sizeof(float), data);
+  return buffer;
+}
+
+void RunMatmul(float* out, const float* in, int in_size, int out_size,
+               cl::Buffer weight_buffer, FPGA& fpga) {
+  for (int i = 0; i < in_size; ++i) {
+    fpga.ptr_a[i] = in[i];
+  }
+
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a}, 0);
+  fpga.kernel_matmul.setArg(1, weight_buffer);
+  fpga.kernel_matmul.setArg(3, in_size);
+  fpga.kernel_matmul.setArg(4, out_size);
+  fpga.q.enqueueTask(fpga.kernel_matmul);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
+
+  for (int i = 0; i < out_size; ++i) {
+    out[i] = fpga.ptr_result[i];
+  }
+}
+
+void RunRMSNorm(float* out, const float* in, cl::Buffer weight_buffer,
+                FPGA& fpga) {
+  for (int i = 0; i < kDim; ++i) {
+    fpga.ptr_a[i] = in[i];
+  }
+
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a}, 0);
+  fpga.kernel_rmsnorm.setArg(1, weight_buffer);
+  fpga.kernel_rmsnorm.setArg(3, kDim);
+  fpga.q.enqueueTask(fpga.kernel_rmsnorm);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
+
+  for (int i = 0; i < kDim; ++i) {
+    out[i] = fpga.ptr_result[i];
+  }
+}
+
+} // namespace
+
+void UploadDeviceWeights(DeviceWeights& out, const Weights& w,
+                         const Tensor2dTok& tok_emb_table, cl::Context context,
+                         cl::CommandQueue q) {
+  for (int layer = 0; layer < kNLayers; ++layer) {
+    out.rms_att_w[layer] =
+        UploadReadOnly(context, q, w.rms_att_w[layer], kDim);
+    out.attn_wq[layer] =
+        UploadReadOnly(context, q, w.attn_wq[layer][0], kDim * kDim);
+    out.attn_wk[layer] =
+        UploadReadOnly(context, q, w.attn_wk[layer][0], kDim * kDim);
+    out.attn_wv[layer] =
+        UploadReadOnly(context, q, w.attn_wv[layer][0], kDim * kDim);
+    out.attn_wo[layer] =
+        UploadReadOnly(context, q, w.attn_wo[layer][0], kDim * kDim);
+
+    out.rms_ffn_w[layer] =
+        UploadReadOnly(context, q, w.rms_ffn_w[layer], kDim);
+    out.ffn_w1[layer] =
+        UploadReadOnly(context, q, w.ffn_w1[layer][0], kHiddenDim * kDim);
+    out.ffn_w2[layer] =
+        UploadReadOnly(context, q, w.ffn_w2[layer][0], kDim * kHiddenDim);
+    out.ffn_w3[layer] =
+        UploadReadOnly(context, q, w.ffn_w3[layer][0], kHiddenDim * kDim);
+  }
+
+  out.rms_final = UploadReadOnly(context, q, w.rms_final, kDim);
+  for (int tile = 0; tile < (kVocabSize + kVocabTile - 1) / kVocabTile;
+       ++tile) {
+    const int row_begin = tile * kVocabTile;
+    out.lm_head_rows[tile] = std::min(kVocabTile, kVocabSize - row_begin);
+    out.lm_head[tile] = UploadReadOnly(context, q, tok_emb_table[row_begin],
+                                       out.lm_head_rows[tile] * kDim);
+  }
+}
 
 /* ---------------------------------  /
       Basic Arithmetic Operations
 /  --------------------------------- */
 
-// Add a scalar to each element of the input tensor.
-void AddFPGA(Tensor1d& out, const Tensor1d& in, float a, cl::CommandQueue q,
-             cl::Kernel kernel_add, float* ptr_a, float* ptr_b,
-             float* ptr_result, cl::Buffer buffer_a, cl::Buffer buffer_b,
-             cl::Buffer buffer_result) {
-  for (int i = 0; i < kDim; i++) {
-    ptr_a[i] = in[i];
-  }
-  for (int i = 0; i < kDim; i++) {
-    ptr_b[i] = a;
-  }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_add.setArg(3, kDim);
-  q.enqueueTask(kernel_add);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kDim; i++) {
-    out[i] = ptr_result[i];
-  }
-}
-
-// Multiply each element of the input tensor by a scalar.
-void MulFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, float a,
-             cl::CommandQueue q, cl::Kernel kernel_mul, float* ptr_a,
-             float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-             cl::Buffer buffer_b, cl::Buffer buffer_result) {
-  for (int i = 0; i < kSeqLen; i++) {
-    ptr_a[i] = in[i];
-  }
-  for (int i = 0; i < kSeqLen; i++) {
-    ptr_b[i] = a;
-  }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_mul.setArg(3, kSeqLen);
-  q.enqueueTask(kernel_mul);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kSeqLen; i++) {
-    out[i] = ptr_result[i];
-  }
-}
-
-// Add each element of the first input tensor to the corresponding element of
-// the second input tensor.
 void AddFPGA(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs,
-             cl::CommandQueue q, cl::Kernel kernel_add, float* ptr_a,
-             float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-             cl::Buffer buffer_b, cl::Buffer buffer_result) {
+             FPGA& fpga) {
   for (int i = 0; i < kDim; i++) {
-    ptr_a[i] = lhs[i];
+    fpga.ptr_a[i] = lhs[i];
   }
   for (int i = 0; i < kDim; i++) {
-    ptr_b[i] = rhs[i];
+    fpga.ptr_b[i] = rhs[i];
   }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_add.setArg(3, kDim);
-  q.enqueueTask(kernel_add);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a, fpga.buffer_b}, 0);
+  fpga.kernel_add.setArg(3, kDim);
+  fpga.q.enqueueTask(fpga.kernel_add);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
   for (int i = 0; i < kDim; i++) {
-    out[i] = ptr_result[i];
+    out[i] = fpga.ptr_result[i];
   }
 }
 
-// Multiply each element of the first input tensor by the corresponding element
-// of the second input tensor.
+void MulFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, float a, FPGA& fpga) {
+  for (int i = 0; i < kSeqLen; i++) {
+    fpga.ptr_a[i] = in[i];
+  }
+  for (int i = 0; i < kSeqLen; i++) {
+    fpga.ptr_b[i] = a;
+  }
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a, fpga.buffer_b}, 0);
+  fpga.kernel_mul.setArg(3, kSeqLen);
+  fpga.q.enqueueTask(fpga.kernel_mul);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
+  for (int i = 0; i < kSeqLen; i++) {
+    out[i] = fpga.ptr_result[i];
+  }
+}
+
 void MulFPGA(Tensor1dFFNB& out, const Tensor1dFFNB& lhs,
-             const Tensor1dFFNB& rhs, cl::CommandQueue q, cl::Kernel kernel_mul,
-             float* ptr_a, float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-             cl::Buffer buffer_b, cl::Buffer buffer_result) {
-  for (int i = 0; i < kFFNDim; i++) {
-    ptr_a[i] = lhs[i];
+             const Tensor1dFFNB& rhs, FPGA& fpga) {
+  for (int i = 0; i < kHiddenDim; i++) {
+    fpga.ptr_a[i] = lhs[i];
   }
-  for (int i = 0; i < kFFNDim; i++) {
-    ptr_b[i] = rhs[i];
+  for (int i = 0; i < kHiddenDim; i++) {
+    fpga.ptr_b[i] = rhs[i];
   }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_mul.setArg(3, kFFNDim);
-  q.enqueueTask(kernel_mul);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kFFNDim; i++) {
-    out[i] = ptr_result[i];
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a, fpga.buffer_b}, 0);
+  fpga.kernel_mul.setArg(3, kHiddenDim);
+  fpga.q.enqueueTask(fpga.kernel_mul);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
+  for (int i = 0; i < kHiddenDim; i++) {
+    out[i] = fpga.ptr_result[i];
   }
 }
 
@@ -98,81 +155,41 @@ void MulFPGA(Tensor1dFFNB& out, const Tensor1dFFNB& lhs,
            Matrix Operations
 /  --------------------------------- */
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1d [dim] . Tensor2dAttn [dim, dim] = Tensor1d [dim]
-// out[i] = w[i,j] . in[j]
-void MatmulFPGA(Tensor1d& out, const Tensor1d& in, const Tensor2dAttn& w,
-                cl::CommandQueue q, cl::Kernel kernel_matmul, float* ptr_a,
-                float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                cl::Buffer buffer_b, cl::Buffer buffer_result) {
-  for (int i = 0; i < kDim; i++) {
-    ptr_a[i] = in[i];
-  }
-  for (int i = 0; i < kDim; i++) {
-    for (int j = 0; j < kDim; j++) {
-      ptr_b[i * kDim + j] = w[i][j];
-    }
-  }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_matmul.setArg(3, kDim);
-  kernel_matmul.setArg(4, kDim);
-  q.enqueueTask(kernel_matmul);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kDim; i++) {
-    out[i] = ptr_result[i];
-  }
+void MatmulFPGA(Tensor1d& out, const Tensor1d& in, cl::Buffer weight_buffer,
+                FPGA& fpga) {
+  RunMatmul(out, in, kDim, kDim, weight_buffer, fpga);
 }
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1dFFNB [ffn_dim] . Tensor2dFFNA [ffn_dim, dim] = Tensor1dFFNB [ffn_dim]
-// out[i] = w[i,j] . in[j]
-void MatmulFPGA(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNA& w,
-                cl::CommandQueue q, cl::Kernel kernel_matmul, float* ptr_a,
-                float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                cl::Buffer buffer_b, cl::Buffer buffer_result) {
-  for (int i = 0; i < kDim; i++) {
-    ptr_a[i] = in[i];
-  }
-  for (int i = 0; i < kFFNDim; i++) {
-    for (int j = 0; j < kDim; j++) {
-      ptr_b[i * kDim + j] = w[i][j];
-    }
-  }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_matmul.setArg(3, kDim);
-  kernel_matmul.setArg(4, kFFNDim);
-  q.enqueueTask(kernel_matmul);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kFFNDim; i++) {
-    out[i] = ptr_result[i];
-  }
+void MatmulFPGA(Tensor1dFFNB& out, const Tensor1d& in,
+                cl::Buffer weight_buffer, FPGA& fpga) {
+  RunMatmul(out, in, kDim, kHiddenDim, weight_buffer, fpga);
 }
 
-// Compute the matrix multiplication of two input tensors.
-// Tensor1d [dim] . Tensor2dFFNB [dim, ffn_dim] = Tensor1dFFNB [ffn_dim]
-// out[i] = w[i,j] . in[j]
-void MatmulFPGA(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNB& w,
-                cl::CommandQueue q, cl::Kernel kernel_matmul, float* ptr_a,
-                float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                cl::Buffer buffer_b, cl::Buffer buffer_result) {
-  for (int i = 0; i < kFFNDim; i++) {
-    ptr_a[i] = in[i];
+void MatmulFPGA(Tensor1d& out, const Tensor1dFFNB& in,
+                cl::Buffer weight_buffer, FPGA& fpga) {
+  RunMatmul(out, in, kHiddenDim, kDim, weight_buffer, fpga);
+}
+
+void LmHeadFPGA(Tensor1dLogits& out, const Tensor1d& in, FPGA& fpga) {
+  for (int i = 0; i < kDim; ++i) {
+    fpga.ptr_a[i] = in[i];
   }
-  for (int i = 0; i < kDim; i++) {
-    for (int j = 0; j < kFFNDim; j++) {
-      ptr_b[i * kFFNDim + j] = w[i][j];
+
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a}, 0);
+  for (int tile = 0; tile < (kVocabSize + kVocabTile - 1) / kVocabTile;
+       ++tile) {
+    fpga.kernel_matmul.setArg(1, fpga.weights.lm_head[tile]);
+    fpga.kernel_matmul.setArg(3, kDim);
+    fpga.kernel_matmul.setArg(4, fpga.weights.lm_head_rows[tile]);
+    fpga.q.enqueueTask(fpga.kernel_matmul);
+    fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                    CL_MIGRATE_MEM_OBJECT_HOST);
+    fpga.q.finish();
+
+    const int row_begin = tile * kVocabTile;
+    for (int i = 0; i < fpga.weights.lm_head_rows[tile]; ++i) {
+      out[row_begin + i] = fpga.ptr_result[i];
     }
-  }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_matmul.setArg(3, kFFNDim);
-  kernel_matmul.setArg(4, kDim);
-  q.enqueueTask(kernel_matmul);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kDim; i++) {
-    out[i] = ptr_result[i];
   }
 }
 
@@ -180,49 +197,30 @@ void MatmulFPGA(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNB& w,
       Normalization Operations
 /  --------------------------------- */
 
-// Apply the RMS normalization to the input tensor.
-// norm = 1 / sum_i..N (in[i]^2) / N
-// out[i] = x[i] * norm * w[i]
-void RMSNormFPGA(Tensor1d& out, const Tensor1d& in, const Tensor1d& w,
-                 cl::CommandQueue q, cl::Kernel kernel_rmsnorm, float* ptr_a,
-                 float* ptr_b, float* ptr_result, cl::Buffer buffer_a,
-                 cl::Buffer buffer_b, cl::Buffer buffer_result) {
-  for (int i = 0; i < kDim; i++) {
-    ptr_a[i] = in[i];
-  }
-  for (int i = 0; i < kDim; i++) {
-    ptr_b[i] = w[i];
-  }
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b}, 0);
-  kernel_rmsnorm.setArg(3, kDim);
-  q.enqueueTask(kernel_rmsnorm);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
-  for (int i = 0; i < kDim; i++) {
-    out[i] = ptr_result[i];
-  }
+void RMSNormFPGA(Tensor1d& out, const Tensor1d& in, cl::Buffer weight_buffer,
+                 FPGA& fpga) {
+  RunRMSNorm(out, in, weight_buffer, fpga);
 }
 
 // Apply the softmax function to the input tensor.
 // out[i] = exp(in[i]) / sum(exp(in[i]))
 void SoftmaxFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, int in_max_idx,
-                 cl::CommandQueue q, cl::Kernel kernel_softmax, float* ptr_a,
-                 float* ptr_result, cl::Buffer buffer_a,
-                 cl::Buffer buffer_result) {
+                 FPGA& fpga) {
   if (in_max_idx == -1) {
     in_max_idx = kSeqLen;
   }
 
   for (int i = 0; i < in_max_idx; i++) {
-    ptr_a[i] = in[i];
+    fpga.ptr_a[i] = in[i];
   }
-  q.enqueueMigrateMemObjects({buffer_a}, 0);
-  kernel_softmax.setArg(2, in_max_idx);
-  q.enqueueTask(kernel_softmax);
-  q.enqueueMigrateMemObjects({buffer_result}, CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_a}, 0);
+  fpga.kernel_softmax.setArg(2, in_max_idx);
+  fpga.q.enqueueTask(fpga.kernel_softmax);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
   for (int i = 0; i < in_max_idx; i++) {
-    out[i] = ptr_result[i];
+    out[i] = fpga.ptr_result[i];
   }
 }
 
@@ -237,33 +235,29 @@ void SoftmaxFPGA(Tensor1dQKSM& out, const Tensor1dQKSM& in, int in_max_idx,
 // k_out[i+1] = k_in[i] * sin_vec[i] + k_in[i+1] * cos_vec[i]
 void RoPEFPGA(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in,
               const Tensor1d& k_in, const Tensor1dSinCos& cos_vec,
-              const Tensor1dSinCos& sin_vec, int head_begin, int head_dim,
-              cl::CommandQueue q, cl::Kernel kernel_rope, float* ptr_a,
-              float* ptr_b, float* ptr_c, float* ptr_d, float* ptr_result,
-              float* ptr_result2, cl::Buffer buffer_a, cl::Buffer buffer_b,
-              cl::Buffer buffer_c, cl::Buffer buffer_d,
-              cl::Buffer buffer_result, cl::Buffer buffer_result2) {
+              const Tensor1dSinCos& sin_vec, int head_begin, FPGA& fpga) {
 
-  for (int i = 0; i < 288; i++) {
-    ptr_a[i] = q_in[i];
-    ptr_b[i] = k_in[i];
+  for (int i = 0; i < kDim; i++) {
+    fpga.ptr_a[i] = q_in[i];
+    fpga.ptr_b[i] = k_in[i];
   }
 
-  for (int i = 0; i < 24; i++) {
-    ptr_c[i] = cos_vec[i];
-    ptr_d[i] = sin_vec[i];
+  for (int i = 0; i < kDim / kNHeads / 2; i++) {
+    fpga.ptr_c[i] = cos_vec[i];
+    fpga.ptr_d[i] = sin_vec[i];
   }
 
-  q.enqueueMigrateMemObjects({buffer_a, buffer_b, buffer_c, buffer_d}, 0);
-  kernel_rope.setArg(6, head_begin);
-  q.enqueueTask(kernel_rope);
-  q.enqueueMigrateMemObjects({buffer_result, buffer_result2},
-                             CL_MIGRATE_MEM_OBJECT_HOST);
-  q.finish();
+  fpga.q.enqueueMigrateMemObjects(
+      {fpga.buffer_a, fpga.buffer_b, fpga.buffer_c, fpga.buffer_d}, 0);
+  fpga.kernel_rope.setArg(6, head_begin);
+  fpga.q.enqueueTask(fpga.kernel_rope);
+  fpga.q.enqueueMigrateMemObjects({fpga.buffer_result, fpga.buffer_result2},
+                                  CL_MIGRATE_MEM_OBJECT_HOST);
+  fpga.q.finish();
 
-  for (int i = 0; i < 288; i++) {
-    q_out[i] = ptr_result[i];
-    k_out[i] = ptr_result2[i];
+  for (int i = head_begin; i < head_begin + kDim / kNHeads; i++) {
+    q_out[i] = fpga.ptr_result[i];
+    k_out[i] = fpga.ptr_result2[i];
   }
 }
 

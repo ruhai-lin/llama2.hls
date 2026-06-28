@@ -2,36 +2,35 @@
 #define TENSOR_HPP_
 
 #include <string>
+#include <utility>
 
 namespace llama2 {
 
 constexpr int kDim = 288;
+constexpr int kHiddenDim = 768;
+constexpr int kNLayers = 6;
+constexpr int kNHeads = 6;
+constexpr int kNKVHeads = 6;
 constexpr int kVocabSize = 32000;
-constexpr int kNumLayers = 6;
-constexpr int kNumHeads = 6;
-constexpr int kNumKVHeads = 6;
-constexpr int kSinCosTable = 24;
 constexpr int kSeqLen = 256;
-constexpr int kFFNDim = 768;
-constexpr int kHalvedHeadDim = (kDim / kNumLayers);
 
 using Tensor1d = float[kDim];
 using Tensor2dTok = float[kVocabSize][kDim];
 using Tensor2dAttn = float[kDim][kDim];
-using Tensor3dAttn = float[kNumLayers][kDim][kDim];
-using Tensor2dRMS = float[kNumLayers][kDim];
-using Tensor1dSinCos = float[kSinCosTable];
-using Tensor2dSinCos = float[kSeqLen][kSinCosTable];
-using Tensor2dFFNA = float[kFFNDim][kDim];
-using Tensor3dFFNA = float[kNumLayers][kFFNDim][kDim];
-using Tensor1dFFNB = float[kFFNDim];
-using Tensor2dFFNB = float[kDim][kFFNDim];
-using Tensor3dFFNB = float[kNumLayers][kDim][kFFNDim];
+using Tensor3dAttn = float[kNLayers][kDim][kDim];
+using Tensor2dRMS = float[kNLayers][kDim];
+using Tensor1dSinCos = float[kDim / kNHeads / 2];
+using Tensor2dSinCos = float[kSeqLen][kDim / kNHeads / 2];
+using Tensor2dFFNA = float[kHiddenDim][kDim];
+using Tensor3dFFNA = float[kNLayers][kHiddenDim][kDim];
+using Tensor1dFFNB = float[kHiddenDim];
+using Tensor2dFFNB = float[kDim][kHiddenDim];
+using Tensor3dFFNB = float[kNLayers][kDim][kHiddenDim];
 using Tensor1dQKSM = float[kSeqLen];
-using Tensor2dQKSM = float[kNumLayers][kSeqLen];
-using Tensor2dFFNC = float[kNumLayers][kFFNDim];
+using Tensor2dQKSM = float[kNLayers][kSeqLen];
+using Tensor2dFFNC = float[kNLayers][kHiddenDim];
 using Tensor2dCache = float[kSeqLen][kDim];
-using Tensor3dCache = float[kNumLayers][kSeqLen][kDim];
+using Tensor3dCache = float[kNLayers][kSeqLen][kDim];
 using Tensor1dLogits = float[kVocabSize];
 using Tensor2d = float[kDim][kDim];
 using Tensor3d = float[kDim][kDim][kDim];
@@ -74,7 +73,7 @@ int Argmax(const Tensor1dLogits& values);
 
 void RoPE(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in,
           const Tensor1d& k_in, const Tensor1dSinCos& cos_vec,
-          const Tensor1dSinCos& sin_vec, int head_begin, int head_size);
+          const Tensor1dSinCos& sin_vec, int head_begin);
 
 } // namespace llama2
 

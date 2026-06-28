@@ -21,9 +21,9 @@ struct Weights {
 
   // FFN
   Tensor2dRMS rms_ffn_w; // [n_layers, dim]
-  Tensor3dFFNA ffn_w1;   // [n_layers, ffn_dim, dim]
-  Tensor3dFFNB ffn_w2;   // [n_layers, dim, ffn_dim]
-  Tensor3dFFNA ffn_w3;   // [n_layers, ffn_dim, dim]
+  Tensor3dFFNA ffn_w1;   // [n_layers, hidden_dim, dim]
+  Tensor3dFFNB ffn_w2;   // [n_layers, dim, hidden_dim]
+  Tensor3dFFNA ffn_w3;   // [n_layers, hidden_dim, dim]
 
   // Final rmsnorm
   Tensor1d rms_final; // [dim]

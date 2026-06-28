@@ -1,5 +1,7 @@
 #ifndef USE_CPU_ONLY
 
+#include "tensor.hpp"
+
 #include <hls_stream.h>
 #include <math.h>
 #include <stdint.h>
@@ -18,26 +20,28 @@ static void compute_rope(hls::stream<float>& q_in_stream,
                          hls::stream<float>& q_out_stream,
                          hls::stream<float>& k_out_stream, int head_begin) {
 
-  float q_local[288];
-  float k_local[288];
+  float q_local[llama2::kDim];
+  float k_local[llama2::kDim];
 
-  float cos_local[24];
-  float sin_local[24];
+  float cos_local[llama2::kDim / llama2::kNHeads / 2];
+  float sin_local[llama2::kDim / llama2::kNHeads / 2];
 
-  float q_out_local[288];
-  float k_out_local[288];
+  float q_out_local[llama2::kDim];
+  float k_out_local[llama2::kDim];
 
-  for (int i = 0; i < 288; i++) {
+  for (int i = 0; i < llama2::kDim; i++) {
     q_local[i] = q_in_stream.read();
     k_local[i] = k_in_stream.read();
+    q_out_local[i] = q_local[i];
+    k_out_local[i] = k_local[i];
   }
 
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < llama2::kDim / llama2::kNHeads / 2; i++) {
     cos_local[i] = cos_vec_stream.read();
     sin_local[i] = sin_vec_stream.read();
   }
 
-  for (int i = 0; i < 48; ++i) {
+  for (int i = 0; i < llama2::kDim / llama2::kNHeads / 2; ++i) {
     int i0 = head_begin + i * 2 + 0;
     int i1 = head_begin + i * 2 + 1;
 
@@ -57,7 +61,7 @@ static void compute_rope(hls::stream<float>& q_in_stream,
     k_out_local[i1] = k0 * sin + k1 * cos;
   }
 
-  for (int i = 0; i < 288; i++) {
+  for (int i = 0; i < llama2::kDim; i++) {
     q_out_stream << q_out_local[i];
     k_out_stream << k_out_local[i];
   }
@@ -91,14 +95,14 @@ void kernel_rope(float* q_in, float* k_in, float* cos_vec, float* sin_vec,
   static hls::stream<float> k_out_stream("k_out_stream");
 
 #pragma HLS dataflow
-  load_vec(q_in, q_in_stream, 288);
-  load_vec(k_in, k_in_stream, 288);
-  load_vec(cos_vec, cos_vec_stream, 24);
-  load_vec(sin_vec, sin_vec_stream, 24);
+  load_vec(q_in, q_in_stream, llama2::kDim);
+  load_vec(k_in, k_in_stream, llama2::kDim);
+  load_vec(cos_vec, cos_vec_stream, llama2::kDim / llama2::kNHeads / 2);
+  load_vec(sin_vec, sin_vec_stream, llama2::kDim / llama2::kNHeads / 2);
   compute_rope(q_in_stream, k_in_stream, cos_vec_stream, sin_vec_stream,
                q_out_stream, k_out_stream, head_begin);
-  store_result(q_out, q_out_stream, 288);
-  store_result(k_out, k_out_stream, 288);
+  store_result(q_out, q_out_stream, llama2::kDim);
+  store_result(k_out, k_out_stream, llama2::kDim);
 }
 }
 

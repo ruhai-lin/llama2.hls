@@ -81,7 +81,7 @@ void Sub(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs) {
 // Multiply each element of the first input tensor by the corresponding element
 // of the second input tensor.
 void Mul(Tensor1dFFNB& out, const Tensor1dFFNB& lhs, const Tensor1dFFNB& rhs) {
-  for (size_t i = 0; i < kFFNDim; ++i) {
+  for (size_t i = 0; i < kHiddenDim; ++i) {
     out[i] = lhs[i] * rhs[i];
   }
 }
@@ -122,10 +122,10 @@ void Matmul(Tensor1d& out, const Tensor1d& in, const Tensor2dAttn& w) {
 }
 
 // Compute the matrix multiplication of two input tensors.
-// Tensor1dFFNB [ffn_dim] . Tensor2dFFNA [ffn_dim, dim] = Tensor1dFFNB [ffn_dim]
+// Tensor1dFFNB [hidden_dim] . Tensor2dFFNA [hidden_dim, dim] = Tensor1dFFNB [hidden_dim]
 // out[i] = w[i,j] . in[j]
 void Matmul(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNA& w) {
-  for (size_t i = 0; i < kFFNDim; ++i) {
+  for (size_t i = 0; i < kHiddenDim; ++i) {
     float sum = 0;
     for (size_t j = 0; j < kDim; j++) {
       sum += w[i][j] * in[j];
@@ -135,12 +135,12 @@ void Matmul(Tensor1dFFNB& out, const Tensor1d& in, const Tensor2dFFNA& w) {
 }
 
 // Compute the matrix multiplication of two input tensors.
-// Tensor1d [dim] . Tensor2dFFNB [dim, ffn_dim] = Tensor1dFFNB [ffn_dim]
+// Tensor1d [dim] . Tensor2dFFNB [dim, hidden_dim] = Tensor1dFFNB [hidden_dim]
 // out[i] = w[i,j] . in[j]
 void Matmul(Tensor1d& out, const Tensor1dFFNB& in, const Tensor2dFFNB& w) {
   for (size_t i = 0; i < kDim; ++i) {
     float sum = 0;
-    for (size_t j = 0; j < kFFNDim; j++) {
+    for (size_t j = 0; j < kHiddenDim; j++) {
       sum += w[i][j] * in[j];
     }
     out[i] = sum;
@@ -226,7 +226,7 @@ inline float SiLU(float x) {
 // Apply the SiLU activation function to each element of the input tensor.
 // out[i] = in[i] * (1 / (1 + exp(-in[i])))
 void SiLU(Tensor1dFFNB& out, const Tensor1dFFNB& in) {
-  for (size_t i = 0; i < kFFNDim; ++i) {
+  for (size_t i = 0; i < kHiddenDim; ++i) {
     out[i] = SiLU(in[i]);
   }
 }
@@ -366,9 +366,8 @@ int Argmax(const Tensor1dLogits& in) {
 // k_out[i] = k_in[i] * cos_vec[i] - k_in[i+1] * sin_vec[i]
 // k_out[i+1] = k_in[i] * sin_vec[i] + k_in[i+1] * cos_vec[i]
 void RoPE(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in, const Tensor1d& k_in,
-          const Tensor1dSinCos& cos_vec, const Tensor1dSinCos& sin_vec, int head_begin,
-          int head_dim) {
-  for (int i = 0; i < kHalvedHeadDim; ++i) {
+          const Tensor1dSinCos& cos_vec, const Tensor1dSinCos& sin_vec, int head_begin) {
+  for (int i = 0; i < kDim / kNHeads / 2; ++i) {
     int i0 = head_begin + i * 2 + 0;
     int i1 = head_begin + i * 2 + 1;
 

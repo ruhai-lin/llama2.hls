@@ -1,5 +1,7 @@
 #ifndef USE_CPU_ONLY
 
+#include "tensor.hpp"
+
 #include <hls_stream.h>
 #include <math.h>
 #include <stdint.h>
@@ -15,24 +17,24 @@ static void compute_rmsnorm(hls::stream<float>& in1_stream,
                             hls::stream<float>& in2_stream,
                             hls::stream<float>& out_stream) {
 
-  float vec_local_1[288];
-  float vec_local_2[288];
+  float vec_local_1[llama2::kDim];
+  float vec_local_2[llama2::kDim];
   float sum_local = 0;
-  for (int i = 0; i < 288; i++) {
+  for (int i = 0; i < llama2::kDim; i++) {
     vec_local_1[i] = in1_stream.read();
   }
-  for (int i = 0; i < 288; i++) {
+  for (int i = 0; i < llama2::kDim; i++) {
     vec_local_2[i] = in2_stream.read();
   }
 
-  for (int i = 0; i < 288; i++) {
+  for (int i = 0; i < llama2::kDim; i++) {
     sum_local += vec_local_1[i] * vec_local_1[i];
   }
 
   constexpr float eps = 1e-5;
-  const float norm = 1 / std::sqrt(sum_local / 288 + eps);
+  const float norm = 1 / std::sqrt(sum_local / llama2::kDim + eps);
 
-  for (size_t i = 0; i < 288; i++) {
+  for (size_t i = 0; i < llama2::kDim; i++) {
     out_stream << vec_local_1[i] * norm * vec_local_2[i];
   }
 }

@@ -14,7 +14,7 @@ void DumpTensor1d(std::string file, const Tensor1d& tensor) {
 
 void DumpTensor1dFFNB(std::string file, const Tensor1dFFNB& tensor) {
   std::ofstream fs(file);
-  for (int i = 0; i < kFFNDim; ++i) {
+  for (int i = 0; i < kHiddenDim; ++i) {
     fs << tensor[i] << std::endl;
   }
   fs.close();

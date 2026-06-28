@@ -118,10 +118,10 @@ int main(int argc, char* argv[]) {
   // 2. Print hyper parameters.
   std::cout << "Hyper Parameters" << std::endl
             << "  dim       : " << llama2::kDim << std::endl
-            << "  ffn_dim   : " << llama2::kFFNDim << std::endl
-            << "  n_layers  : " << llama2::kNumLayers << std::endl
-            << "  n_heads   : " << llama2::kNumHeads << std::endl
-            << "  n_kv_heads: " << llama2::kNumKVHeads << std::endl
+            << "  hidden_dim: " << llama2::kHiddenDim << std::endl
+            << "  n_layers  : " << llama2::kNLayers << std::endl
+            << "  n_heads   : " << llama2::kNHeads << std::endl
+            << "  n_kv_heads: " << llama2::kNKVHeads << std::endl
             << "  vocab_size: " << llama2::kVocabSize << std::endl
             << "  seq_len   : " << llama2::kSeqLen << std::endl;
 
@@ -317,6 +317,28 @@ int main(int argc, char* argv[]) {
   OCL_CHECK(err, ptr_result2 = (float*)q.enqueueMapBuffer(
                      buffer_result2, CL_TRUE, CL_MAP_READ, 0, size_in_bytes,
                      NULL, NULL, &err));
+
+  llama2::FPGA fpga;
+  fpga.q = q;
+  fpga.kernel_matmul = kernel_matmul;
+  fpga.kernel_mul = kernel_mul;
+  fpga.kernel_rmsnorm = kernel_rmsnorm;
+  fpga.kernel_softmax = kernel_softmax;
+  fpga.kernel_add = kernel_add;
+  fpga.kernel_rope = kernel_rope;
+  fpga.ptr_a = ptr_a;
+  fpga.ptr_b = ptr_b;
+  fpga.ptr_c = ptr_c;
+  fpga.ptr_d = ptr_d;
+  fpga.ptr_result = ptr_result;
+  fpga.ptr_result2 = ptr_result2;
+  fpga.buffer_a = buffer_a;
+  fpga.buffer_b = buffer_b;
+  fpga.buffer_c = buffer_c;
+  fpga.buffer_d = buffer_d;
+  fpga.buffer_result = buffer_result;
+  fpga.buffer_result2 = buffer_result2;
+  llama2::UploadDeviceWeights(fpga.weights, weights, tok_emb_table, context, q);
 #endif // USE_CPU_ONLY
 
   // 6. Decode
@@ -340,15 +362,16 @@ int main(int argc, char* argv[]) {
                  ctx_final_norm, weights
 #ifndef USE_CPU_ONLY
                  ,
-                 q, kernel_matmul, kernel_mul, kernel_rmsnorm, kernel_softmax,
-                 kernel_add, kernel_rope, ptr_a, ptr_b, ptr_c, ptr_d,
-                 ptr_result, ptr_result2, buffer_a, buffer_b, buffer_c,
-                 buffer_d, buffer_result, buffer_result2
+                 fpga
 #endif // USE_CPU_ONLY
     );
 
-    // 6-2. Calculate the logits and softmax.
+    // 6-2. Calculate the logits.
+#ifndef USE_CPU_ONLY
+    llama2::LmHeadFPGA(ctx_logits, ctx_final_norm, fpga);
+#else
     llama2::MutmulVocab(ctx_logits, ctx_final_norm, tok_emb_table);
+#endif
 
     if (args.print_softmax) {
       printf("\nSoftmax\n <- ");
@@ -377,7 +400,7 @@ int main(int argc, char* argv[]) {
 
     // Dump the contexts.
     if (args.log) {
-      DumpContext("log/" + std::to_string(pos) + "_", ctx, llama2::kNumLayers);
+      DumpContext("log/" + std::to_string(pos) + "_", ctx, llama2::kNLayers);
     }
 
     token = next;
@@ -401,7 +424,9 @@ int main(int argc, char* argv[]) {
   OCL_CHECK(err, err = q.enqueueUnmapMemObject(buffer_result2, ptr_result2));
   OCL_CHECK(err, err = q.finish());
   std::fflush(nullptr);
+#ifndef LLAMA2_PROFILE_FLUSH
   _Exit(EXIT_SUCCESS);
+#endif
 #endif // USE_CPU_ONLY
 
   return 0;
