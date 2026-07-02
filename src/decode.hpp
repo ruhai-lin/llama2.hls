@@ -24,7 +24,7 @@ void Decode(int tok, int pos, const Tensor1d& ctx_input,
             const Weights& w
 #ifndef USE_CPU_ONLY
             ,
-            cl::CommandQueue q, cl::Kernel kernel_decode, uint32_t* ptr_next,
+            cl::CommandQueue q, cl::Kernel decode_kernel, uint32_t* ptr_next,
             cl::Buffer buffer_next
 #endif // USE_CPU_ONLY
 );

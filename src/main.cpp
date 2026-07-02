@@ -1,5 +1,6 @@
-#include <cstring>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <random>
@@ -57,7 +58,8 @@ cl::Buffer CreateKernelArgBuffer(const cl::Context& context,
                                  T* host_ptr, cl_int* err) {
   (void)kernel;
   (void)argidx;
-  return cl::Buffer(context, flags | CL_MEM_USE_HOST_PTR, bytes, host_ptr, err);
+  (void)host_ptr;
+  return cl::Buffer(context, flags, bytes, nullptr, err);
 }
 #endif // USE_CPU_ONLY
 
@@ -210,7 +212,7 @@ int main(int argc, char* argv[]) {
   cl_int err;
   cl::Context context;
   cl::CommandQueue q;
-  cl::Kernel kernel_decode;
+  cl::Kernel decode_kernel;
   cl::Program program;
   std::vector<cl::Platform> platforms;
   bool found_device = false;
@@ -269,9 +271,8 @@ int main(int argc, char* argv[]) {
       std::cout << "Failed to program device[" << i << "] with xclbin file!\n";
     } else {
       std::cout << "Device[" << i << "]: program successful!\n";
-      OCL_CHECK(err,
-                kernel_decode = cl::Kernel(program, "kernel_decode", &err));
-      std::cout << "load : kernel_decode" << std::endl;
+      OCL_CHECK(err, decode_kernel = cl::Kernel(program, "decode", &err));
+      std::cout << "load : decode" << std::endl;
       valid_device = true;
       break; // we break because we found a valid device
     }
@@ -282,80 +283,117 @@ int main(int argc, char* argv[]) {
   }
 
   OCL_CHECK(err, cl::Buffer buffer_tok_emb = CreateKernelArgBuffer(
-                     context, kernel_decode, 2, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 2, CL_MEM_READ_ONLY,
                      tok_emb_count * sizeof(float), tok_emb_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_rms_att = CreateKernelArgBuffer(
-                     context, kernel_decode, 3, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 3, CL_MEM_READ_ONLY,
                      rms_count * sizeof(float), rms_att_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_attn_wq = CreateKernelArgBuffer(
-                     context, kernel_decode, 4, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 4, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wq_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_attn_wk = CreateKernelArgBuffer(
-                     context, kernel_decode, 5, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 5, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wk_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_attn_wv = CreateKernelArgBuffer(
-                     context, kernel_decode, 6, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 6, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wv_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_attn_wo = CreateKernelArgBuffer(
-                     context, kernel_decode, 7, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 7, CL_MEM_READ_ONLY,
                      attn_count * sizeof(float), attn_wo_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_rms_ffn = CreateKernelArgBuffer(
-                     context, kernel_decode, 8, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 8, CL_MEM_READ_ONLY,
                      rms_count * sizeof(float), rms_ffn_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_ffn_w1 = CreateKernelArgBuffer(
-                     context, kernel_decode, 9, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 9, CL_MEM_READ_ONLY,
                      ffn_a_count * sizeof(float), ffn_w1_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_ffn_w2 = CreateKernelArgBuffer(
-                     context, kernel_decode, 10, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 10, CL_MEM_READ_ONLY,
                      ffn_b_count * sizeof(float), ffn_w2_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_ffn_w3 = CreateKernelArgBuffer(
-                     context, kernel_decode, 11, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 11, CL_MEM_READ_ONLY,
                      ffn_a_count * sizeof(float), ffn_w3_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_rms_final = CreateKernelArgBuffer(
-                     context, kernel_decode, 12, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 12, CL_MEM_READ_ONLY,
                      rms_final_count * sizeof(float), rms_final_host.data(),
                      &err));
   OCL_CHECK(err, cl::Buffer buffer_cos = CreateKernelArgBuffer(
-                     context, kernel_decode, 13, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 13, CL_MEM_READ_ONLY,
                      sincos_count * sizeof(float), cos_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_sin = CreateKernelArgBuffer(
-                     context, kernel_decode, 14, CL_MEM_READ_ONLY,
+                     context, decode_kernel, 14, CL_MEM_READ_ONLY,
                      sincos_count * sizeof(float), sin_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_k_cache = CreateKernelArgBuffer(
-                     context, kernel_decode, 15, CL_MEM_READ_WRITE,
+                     context, decode_kernel, 15, CL_MEM_READ_WRITE,
                      cache_count * sizeof(float), k_cache_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_v_cache = CreateKernelArgBuffer(
-                     context, kernel_decode, 16, CL_MEM_READ_WRITE,
+                     context, decode_kernel, 16, CL_MEM_READ_WRITE,
                      cache_count * sizeof(float), v_cache_host.data(), &err));
   OCL_CHECK(err, cl::Buffer buffer_next = CreateKernelArgBuffer(
-                     context, kernel_decode, 17, CL_MEM_WRITE_ONLY,
+                     context, decode_kernel, 17, CL_MEM_WRITE_ONLY,
                      sizeof(uint32_t), next_host.data(), &err));
 
-  OCL_CHECK(err, err = kernel_decode.setArg(2, buffer_tok_emb));
-  OCL_CHECK(err, err = kernel_decode.setArg(3, buffer_rms_att));
-  OCL_CHECK(err, err = kernel_decode.setArg(4, buffer_attn_wq));
-  OCL_CHECK(err, err = kernel_decode.setArg(5, buffer_attn_wk));
-  OCL_CHECK(err, err = kernel_decode.setArg(6, buffer_attn_wv));
-  OCL_CHECK(err, err = kernel_decode.setArg(7, buffer_attn_wo));
-  OCL_CHECK(err, err = kernel_decode.setArg(8, buffer_rms_ffn));
-  OCL_CHECK(err, err = kernel_decode.setArg(9, buffer_ffn_w1));
-  OCL_CHECK(err, err = kernel_decode.setArg(10, buffer_ffn_w2));
-  OCL_CHECK(err, err = kernel_decode.setArg(11, buffer_ffn_w3));
-  OCL_CHECK(err, err = kernel_decode.setArg(12, buffer_rms_final));
-  OCL_CHECK(err, err = kernel_decode.setArg(13, buffer_cos));
-  OCL_CHECK(err, err = kernel_decode.setArg(14, buffer_sin));
-  OCL_CHECK(err, err = kernel_decode.setArg(15, buffer_k_cache));
-  OCL_CHECK(err, err = kernel_decode.setArg(16, buffer_v_cache));
-  OCL_CHECK(err, err = kernel_decode.setArg(17, buffer_next));
+  OCL_CHECK(err, err = decode_kernel.setArg(2, buffer_tok_emb));
+  OCL_CHECK(err, err = decode_kernel.setArg(3, buffer_rms_att));
+  OCL_CHECK(err, err = decode_kernel.setArg(4, buffer_attn_wq));
+  OCL_CHECK(err, err = decode_kernel.setArg(5, buffer_attn_wk));
+  OCL_CHECK(err, err = decode_kernel.setArg(6, buffer_attn_wv));
+  OCL_CHECK(err, err = decode_kernel.setArg(7, buffer_attn_wo));
+  OCL_CHECK(err, err = decode_kernel.setArg(8, buffer_rms_ffn));
+  OCL_CHECK(err, err = decode_kernel.setArg(9, buffer_ffn_w1));
+  OCL_CHECK(err, err = decode_kernel.setArg(10, buffer_ffn_w2));
+  OCL_CHECK(err, err = decode_kernel.setArg(11, buffer_ffn_w3));
+  OCL_CHECK(err, err = decode_kernel.setArg(12, buffer_rms_final));
+  OCL_CHECK(err, err = decode_kernel.setArg(13, buffer_cos));
+  OCL_CHECK(err, err = decode_kernel.setArg(14, buffer_sin));
+  OCL_CHECK(err, err = decode_kernel.setArg(15, buffer_k_cache));
+  OCL_CHECK(err, err = decode_kernel.setArg(16, buffer_v_cache));
+  OCL_CHECK(err, err = decode_kernel.setArg(17, buffer_next));
 
-  OCL_CHECK(err,
-            err = q.enqueueMigrateMemObjects(
-                {buffer_tok_emb, buffer_rms_att, buffer_attn_wq,
-                 buffer_attn_wk, buffer_attn_wv, buffer_attn_wo,
-                 buffer_rms_ffn, buffer_ffn_w1, buffer_ffn_w2, buffer_ffn_w3,
-                 buffer_rms_final, buffer_cos, buffer_sin, buffer_k_cache,
-                 buffer_v_cache},
-                0));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_tok_emb, CL_FALSE, 0,
+                                            tok_emb_count * sizeof(float),
+                                            tok_emb_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_rms_att, CL_FALSE, 0,
+                                            rms_count * sizeof(float),
+                                            rms_att_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_attn_wq, CL_FALSE, 0,
+                                            attn_count * sizeof(float),
+                                            attn_wq_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_attn_wk, CL_FALSE, 0,
+                                            attn_count * sizeof(float),
+                                            attn_wk_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_attn_wv, CL_FALSE, 0,
+                                            attn_count * sizeof(float),
+                                            attn_wv_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_attn_wo, CL_FALSE, 0,
+                                            attn_count * sizeof(float),
+                                            attn_wo_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_rms_ffn, CL_FALSE, 0,
+                                            rms_count * sizeof(float),
+                                            rms_ffn_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_ffn_w1, CL_FALSE, 0,
+                                            ffn_a_count * sizeof(float),
+                                            ffn_w1_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_ffn_w2, CL_FALSE, 0,
+                                            ffn_b_count * sizeof(float),
+                                            ffn_w2_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_ffn_w3, CL_FALSE, 0,
+                                            ffn_a_count * sizeof(float),
+                                            ffn_w3_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_rms_final, CL_FALSE, 0,
+                                            rms_final_count * sizeof(float),
+                                            rms_final_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_cos, CL_FALSE, 0,
+                                            sincos_count * sizeof(float),
+                                            cos_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_sin, CL_FALSE, 0,
+                                            sincos_count * sizeof(float),
+                                            sin_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_k_cache, CL_FALSE, 0,
+                                            cache_count * sizeof(float),
+                                            k_cache_host.data()));
+  OCL_CHECK(err, err = q.enqueueWriteBuffer(buffer_v_cache, CL_FALSE, 0,
+                                            cache_count * sizeof(float),
+                                            v_cache_host.data()));
   OCL_CHECK(err, err = q.finish());
 #endif // USE_CPU_ONLY
 
@@ -389,7 +427,7 @@ int main(int argc, char* argv[]) {
                  ctx_final_norm, ctx_logits, next, weights
 #ifndef USE_CPU_ONLY
                  ,
-                 q, kernel_decode, next_host.data(), buffer_next
+                 q, decode_kernel, next_host.data(), buffer_next
 #endif // USE_CPU_ONLY
     );
 
