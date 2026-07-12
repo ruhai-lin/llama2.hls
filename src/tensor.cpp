@@ -1,7 +1,6 @@
 #include "tensor.hpp"
 
 #include <cmath>
-#include <fstream>
 
 namespace llama2 {
 
@@ -52,8 +51,9 @@ static void QuantizedMatmul(float* out, int out_size, const float* in,
         dot += static_cast<int32_t>(in_q[col]) *
                static_cast<int32_t>(weight_q[row * in_size + col]);
       }
-      sum += static_cast<float>(dot) * in_s[group] *
-             weight_s[row * group_count + group];
+      const float combined_scale =
+          in_s[group] * weight_s[row * group_count + group];
+      sum += static_cast<float>(dot) * combined_scale;
     }
     out[row] = sum;
   }
@@ -70,49 +70,14 @@ void CopyTensor1d(Tensor1d& dst, const Tensor1d& src) {
   }
 }
 
-// Copies the contents from the source 2D tensor to the destination 2D tensor.
-void CopyTensor2d(Tensor2d& dst, const Tensor2d& src) {
-  for (size_t i = 0; i < kDim; i++) {
-    CopyTensor1d(dst[i], src[i]);
-  }
-}
-
-// Copies the contents from the source 3D tensor to the destination 3D tensor.
-void CopyTensor3d(Tensor3d& dst, const Tensor3d& src) {
-  for (size_t i = 0; i < kDim; i++) {
-    CopyTensor2d(dst[i], src[i]);
-  }
-}
-
 /* ---------------------------------  /
       Basic Arithmetic Operations
 /  --------------------------------- */
-
-// Add a scalar to each element of the input tensor.
-void Add(Tensor1d& out, const Tensor1d& in, float a) {
-  for (size_t i = 0; i < kDim; i++) {
-    out[i] = in[i] + a;
-  }
-}
-
-// Subtract a scalar from each element of the input tensor.
-void Sub(Tensor1d& out, const Tensor1d& in, float a) {
-  for (size_t i = 0; i < kDim; i++) {
-    out[i] = in[i] - a;
-  }
-}
 
 // Multiply each element of the input tensor by a scalar.
 void Mul(Tensor1dQKSM& out, const Tensor1dQKSM& in, float a) {
   for (size_t i = 0; i < kSeqLen; i++) {
     out[i] = in[i] * a;
-  }
-}
-
-// Divide each element of the input tensor by a scalar.
-void Div(Tensor1d& out, const Tensor1d& in, float a) {
-  for (size_t i = 0; i < kDim; i++) {
-    out[i] = in[i] / a;
   }
 }
 
@@ -124,14 +89,6 @@ void Add(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs) {
   }
 }
 
-// Subtract each element of the second input tensor from the corresponding
-// element of the first input tensor.
-void Sub(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs) {
-  for (size_t i = 0; i < kDim; ++i) {
-    out[i] = lhs[i] - rhs[i];
-  }
-}
-
 // Multiply each element of the first input tensor by the corresponding element
 // of the second input tensor.
 void Mul(Tensor1dFFNB& out, const Tensor1dFFNB& lhs, const Tensor1dFFNB& rhs) {
@@ -140,27 +97,9 @@ void Mul(Tensor1dFFNB& out, const Tensor1dFFNB& lhs, const Tensor1dFFNB& rhs) {
   }
 }
 
-// Divide each element of the first input tensor by the corresponding element of
-// the second input tensor.
-void Div(Tensor1d& out, const Tensor1d& lhs, const Tensor1d& rhs) {
-  for (size_t i = 0; i < kDim; ++i) {
-    out[i] = lhs[i] / rhs[i];
-  }
-}
-
 /* ---------------------------------  /
            Matrix Operations
 /  --------------------------------- */
-
-// Compute the inner product of two input tensors.
-// out = Sum_i (lhs[i] . rhs[i])
-float InnerProduct(const Tensor1d& lhs, const Tensor1d& rhs) {
-  float sum = 0;
-  for (size_t i = 0; i < kDim; ++i) {
-    sum += lhs[i] * rhs[i];
-  }
-  return sum;
-}
 
 void Matmul(Tensor1d& out, const Tensor1d& in, const Tensor2dAttnQ& w,
             const Tensor2dAttnS& s) {
@@ -189,9 +128,9 @@ void MutmulVocab(Tensor1dLogits& out, const Tensor1d& in,
 // j = j_begin..j_end
 void MutmulRanged(Tensor1dQKSM& out, const Tensor1d& in, const Tensor2dCache& w,
                   int out_begin, int out_end, int in_begin, int in_end) {
-  for (size_t i = out_begin; i < out_end; ++i) {
+  for (int i = out_begin; i < out_end; ++i) {
     float sum = 0;
-    for (size_t j = in_begin; j < in_end; ++j) {
+    for (int j = in_begin; j < in_end; ++j) {
       sum += w[i][j] * in[j];
     }
     out[i] = sum;
@@ -203,11 +142,12 @@ void MutmulRanged(Tensor1dQKSM& out, const Tensor1d& in, const Tensor2dCache& w,
 // out[i] = w[j,i] . in[j] <- transpose w
 // i = out_begin..out_end
 // j = j_begin..j_end
-void MutmulRangedTranspose(Tensor1d& out, const Tensor1dQKSM& in, const Tensor2dCache& w,
-                           int i_begin, int i_end, int j_begin, int j_end) {
-  for (size_t i = i_begin; i < i_end; ++i) {
+void MutmulRangedTranspose(Tensor1d& out, const Tensor1dQKSM& in,
+                           const Tensor2dCache& w, int i_begin, int i_end,
+                           int j_begin, int j_end) {
+  for (int i = i_begin; i < i_end; ++i) {
     float sum = 0;
-    for (size_t j = j_begin; j < j_end; ++j) {
+    for (int j = j_begin; j < j_end; ++j) {
       // reverse the order of w's index (w[j][i] -> w[i][j])
       sum += w[j][i] * in[j];
     }
@@ -218,18 +158,6 @@ void MutmulRangedTranspose(Tensor1d& out, const Tensor1dQKSM& in, const Tensor2d
 /* ---------------------------------  /
          Activation Functions
 /  --------------------------------- */
-
-inline float ReLU(float x) {
-  return x > 0 ? x : 0;
-}
-
-// Apply the ReLU activation function to each element of the input tensor.
-// out[i] = max(0, in[i])
-void ReLU(Tensor1d& out, const Tensor1d& in) {
-  for (size_t i = 0; i < kDim; ++i) {
-    out[i] = ReLU(in[i]);
-  }
-}
 
 inline float SiLU(float x) {
   return x * (1.0 / (1.0 + std::exp(-x)));
@@ -254,7 +182,6 @@ void RMSNorm(Tensor1d& out, const Tensor1d& in, const Tensor1d& w) {
   // 1. Summation of Square
   float sum = 0.0;
   for (size_t i = 0; i < kDim; i++) {
-#pragma HLS UNROLL
     sum += in[i] * in[i];
   }
 
@@ -326,34 +253,8 @@ void Softmax(Tensor1dLogits& out, const Tensor1dLogits& in, int in_max_idx) {
 }
 
 /* ---------------------------------  /
-      Argmax and Max Operations
+            Argmax
 /  --------------------------------- */
-
-// Return the index and value of the maximum value in the input tensor.
-// max_i = argmax_i (in[i])
-// max_val = max_i (in[i])
-std::pair<int, float> FindMaxIndexAndValue(const Tensor1d& in) {
-  std::pair<int, float> max(0, in[0]);
-  for (int i = 1; i < kDim; i++) {
-    if (in[i] > max.second) {
-      max.first = i;
-      max.second = in[i];
-    }
-  }
-  return max;
-}
-
-// Return the sum of the input tensor.
-// max_val = max_i (in[i])
-float Max(const Tensor1d& in) {
-  float max_val = in[0];
-  for (int i = 1; i < kDim; i++) {
-    if (in[i] > max_val) {
-      max_val = in[i];
-    }
-  }
-  return max_val;
-}
 
 // Return the index of the maximum value in the input tensor.
 // max_i = argmax_i (in[i])
@@ -377,12 +278,12 @@ int Argmax(const Tensor1dLogits& in) {
 // q_out[i+1] = q_in[i] * sin_vec[i] + q_in[i+1] * cos_vec[i]
 // k_out[i] = k_in[i] * cos_vec[i] - k_in[i+1] * sin_vec[i]
 // k_out[i+1] = k_in[i] * sin_vec[i] + k_in[i+1] * cos_vec[i]
-void RoPE(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in, const Tensor1d& k_in,
-          const Tensor1dSinCos& cos_vec, const Tensor1dSinCos& sin_vec, int head_begin,
-          int head_dim) {
-  for (int i = 0; i < kHalvedHeadDim; ++i) {
-    int i0 = head_begin + i * 2 + 0;
-    int i1 = head_begin + i * 2 + 1;
+void RoPE(Tensor1d& q_out, Tensor1d& k_out, const Tensor1d& q_in,
+          const Tensor1d& k_in, const Tensor1dSinCos& cos_vec,
+          const Tensor1dSinCos& sin_vec, int head_begin, int head_dim) {
+  for (int i = 0; i < head_dim / 2; ++i) {
+    const int i0 = head_begin + i * 2;
+    const int i1 = i0 + 1;
 
     float q0 = q_in[i0];
     float q1 = q_in[i1];
