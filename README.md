@@ -1,6 +1,6 @@
 # llama2.hls
 
-Karpathy [tinyllama stories15M](https://huggingface.co/karpathy/tinyllamas) 在 AMD KV260（`xck26-sfvc784-2LV-c`）上的 Vitis HLS 部署。FPGA 侧为单个 `decode` kernel，每个 token 只启动一次设备 kernel，Q8_0 权重与 FP32 KV cache 常驻 DDR，kernel 内完成 W8A8 decode forward 与 LM head。当前 FPGA host 只支持 exact argmax（`--temp 0`），LM head 直接返回 4-byte token id，不回传 32K logits。
+Karpathy [tinyllama stories15M](https://huggingface.co/karpathy/tinyllamas) 在 AMD KV260（`xck26-sfvc784-2LV-c`）上的 Vitis HLS 部署。FPGA 侧为单个 `decode` kernel，每个 token 只启动一次设备 kernel，Q8_0 权重与 FP32 KV cache 常驻 DDR，kernel 内完成 W8A8 decode forward 与 LM head。FPGA host 支持 `generate`、`chat` 和 `server` 三种模式，均使用 exact argmax（`--temp 0`）；LM head 直接返回 4-byte token id，不回传 32K logits。
 
 工具链与板卡环境以 **Vitis / Vivado 2025.2**、官方 **KV260 base platform** 为准。
 
@@ -15,7 +15,7 @@ Karpathy [tinyllama stories15M](https://huggingface.co/karpathy/tinyllamas) 在 
 │   ├── tokenizer.bin       # Llama2 词表（已随仓库提供）
 │   └── tok512.bin          # 260K 极小词表（可选）
 ├── src/
-│   ├── main.cpp            # host 入口
+│   ├── main.cpp            # generate / chat / HTTP server host 入口
 │   ├── decode.cpp / .hpp   # HLS top + host 推理逻辑
 │   └── …
 └── outputs/                # 本地构建产物（git ignore）
@@ -85,6 +85,10 @@ platforminfo /opt/xilinx/2025.2/Vitis/base_platforms/xilinx_kv260_base_202520_1/
 
 `model/stories15M_q8.bin` 是 `llama2.c` version-2 Q8_0 checkpoint，group size为32；`model/tokenizer.bin`也已包含在仓库中。权重文件头、模型shape、group size和shared classifier标志会在加载时校验。
 
+Host tokenizer的BPE encode/decode语义与`references/llama2.c/runq.c`一致。Prompt
+prefill、连续对话状态和HTTP请求都在PS侧管理；PL中的`decode` kernel只接收
+`token`和`pos`，不区分host运行模式。
+
 ## HLS 综合（生成 decode.xo）
 
 本项目只有一个 HLS kernel，top 名为 `decode`，源文件为 `src/decode.cpp`。
@@ -143,6 +147,17 @@ v++ -l -t hw \
 
 ## Host 交叉编译
 
+HTTP server使用与llama.cpp相同的header-only依赖：`cpp-httplib`和
+`nlohmann/json`。依赖下载到gitignored的`outputs/deps/`，不进入项目源码：
+
+```bash
+mkdir -p outputs/deps
+git clone --depth 1 --branch v0.50.1 \
+  https://github.com/yhirose/cpp-httplib.git outputs/deps/cpp-httplib
+git clone --depth 1 --branch v3.12.0 \
+  https://github.com/nlohmann/json.git outputs/deps/json
+```
+
 在 ARM sysroot 下编译 `llama2_host`。将 `COMMON` 换成你的 `xilinx-zynqmp-common` 路径；`-fno-PIC -fno-PIE -no-pie` 与 `-mcmodel=large` 配合使用，避免 SDK 默认 PIC 冲突。
 
 ```bash
@@ -157,6 +172,8 @@ mkdir -p outputs/host outputs/logs
 aarch64-xilinx-linux-g++ -Wall -Wextra -std=c++2a \
   -mcmodel=large -fno-PIC -fno-PIE -no-pie -g --sysroot="$SYSROOT" \
   -Isrc \
+  -Ioutputs/deps/cpp-httplib \
+  -Ioutputs/deps/json/single_include \
   src/context.cpp src/decode.cpp src/main.cpp \
   src/tensor.cpp src/vocab.cpp src/weight.cpp \
   -L"$SYSROOT/usr/lib" \
@@ -240,6 +257,48 @@ sudo xmutil listapps
 cd ~/Projects/llama2_bundle
 ./llama2_host --max_seq 16 --temp 0
 ```
+
+`generate`是默认模式，也可以显式提供prompt：
+
+```bash
+./llama2_host -m generate --prompt "Once upon a time" --max_seq 64
+```
+
+进入连续对话模式：
+
+```bash
+./llama2_host -m chat
+```
+
+Chat使用`references/llama2.c/runq.c`的Llama 2 chat模板并连续保留KV cache，
+直到达到模型的256-token context。TinyStories checkpoint不是chat模型，因此该模式
+只用于验证tokenizer、prompt prefill和连续KV流程，不代表对话质量。
+
+启动本地HTTP服务：
+
+```bash
+./llama2_host -m server --host 127.0.0.1 --port 8080
+```
+
+Server初始化模型、XRT和FPGA buffer一次，只处理一个请求。当前只提供三个接口：
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tinystories-15m-w8a8-kv260",
+    "prompt": "Once upon a time",
+    "max_tokens": 32,
+    "temperature": 0,
+    "stream": false
+  }'
+```
+
+`GET /health`在服务可用时返回HTTP 200和`{"status":"ok"}`。
+`POST /v1/completions`返回llama.cpp/OpenAI-compatible的
+`text_completion` JSON；当前不支持streaming或非零temperature。
 
 当前single-kernel W8A8结构在150 MHz下的板上结果如下。`temp=0`时，
 16-token输出为`Once upon a time, there was a little girl named Lily. She loved`，

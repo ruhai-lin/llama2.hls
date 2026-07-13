@@ -2,9 +2,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -15,6 +19,9 @@
 
 #ifndef USE_CPU_ONLY
 #include <stdlib.h>
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #define CL_HPP_CL_1_2_DEFAULT_BUILD
 #define CL_HPP_TARGET_OPENCL_VERSION 120
@@ -132,8 +139,14 @@ cl::Buffer CreateKernelArgBuffer(const cl::Context& context,
 struct Args {
   std::string weight_path = "./model/stories15M_q8.bin";
   std::string vocab_path = "./model/tokenizer.bin";
+  std::string mode = "generate";
+  std::string prompt;
+  std::string system_prompt;
+  std::string host = "127.0.0.1";
   uint64_t max_seq = 256;
-  float temp = 0.5;
+  float temp = 0.0;
+  int port = 8080;
+  bool has_system_prompt = false;
   bool color = false;
   bool print_softmax = false;
   bool log = false;
@@ -147,10 +160,28 @@ void ParseArgument(int argc, char* argv[], Args& args) {
       args.weight_path = argv[++i];
     } else if (std::strcmp(argv[i], "--vocab_path") == 0 && i + 1 < argc) {
       args.vocab_path = argv[++i];
+    } else if ((std::strcmp(argv[i], "-m") == 0 ||
+                std::strcmp(argv[i], "--m") == 0 ||
+                std::strcmp(argv[i], "--mode") == 0) &&
+               i + 1 < argc) {
+      args.mode = argv[++i];
+    } else if ((std::strcmp(argv[i], "-i") == 0 ||
+                std::strcmp(argv[i], "--prompt") == 0) &&
+               i + 1 < argc) {
+      args.prompt = argv[++i];
+    } else if ((std::strcmp(argv[i], "-y") == 0 ||
+                std::strcmp(argv[i], "--system_prompt") == 0) &&
+               i + 1 < argc) {
+      args.system_prompt = argv[++i];
+      args.has_system_prompt = true;
     } else if (std::strcmp(argv[i], "--max_seq") == 0 && i + 1 < argc) {
       args.max_seq = std::stoull(argv[++i]);
     } else if (std::strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
       args.temp = std::stof(argv[++i]);
+    } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+      args.host = argv[++i];
+    } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+      args.port = std::stoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--color") == 0) {
       args.color = true;
     } else if (std::strcmp(argv[i], "--print_softmax") == 0) {
@@ -166,6 +197,251 @@ void ParseArgument(int argc, char* argv[], Args& args) {
     }
   }
 }
+
+constexpr std::string_view kModelId = "tinystories-15m-w8a8-kv260";
+using Forward = std::function<int(int, int)>;
+
+class Sequence {
+public:
+  explicit Sequence(const Forward& forward) : forward_(forward) {}
+
+  int Advance(int token) {
+    if (pos_ >= llama2::kSeqLen) {
+      throw std::runtime_error("model context is full");
+    }
+    return forward_(token, pos_++);
+  }
+
+  int pos() const { return pos_; }
+
+private:
+  const Forward& forward_;
+  int pos_ = 0;
+};
+
+struct CompletionResult {
+  std::string text;
+  int prompt_tokens = 0;
+  int completion_tokens = 0;
+  int forward_tokens = 0;
+  bool stopped = false;
+};
+
+CompletionResult Complete(const llama2::Vocab& vocab, std::string_view prompt,
+                          int max_tokens, const Forward& forward,
+                          const std::function<void(std::string_view)>&
+                              on_piece = {}) {
+  if (max_tokens <= 0) {
+    throw std::invalid_argument("max_tokens must be positive");
+  }
+
+  const std::vector<int> prompt_tokens =
+      llama2::Encode(vocab, prompt, true, false);
+  if (prompt_tokens.empty()) {
+    throw std::runtime_error("tokenizer produced an empty prompt");
+  }
+  if (prompt_tokens.size() + static_cast<std::size_t>(max_tokens) - 1 >
+      static_cast<std::size_t>(llama2::kSeqLen)) {
+    throw std::invalid_argument("prompt and completion exceed model context");
+  }
+
+  Sequence sequence(forward);
+  int next = 0;
+  for (const int token : prompt_tokens) {
+    next = sequence.Advance(token);
+  }
+
+  CompletionResult result;
+  result.prompt_tokens = static_cast<int>(prompt_tokens.size());
+  int previous = prompt_tokens.back();
+  for (int i = 0; i < max_tokens; ++i) {
+    if (next == 1) {
+      result.stopped = true;
+      break;
+    }
+
+    const std::string piece = llama2::DecodePiece(vocab, previous, next);
+    result.text += piece;
+    ++result.completion_tokens;
+    if (on_piece) {
+      on_piece(piece);
+    }
+
+    previous = next;
+    if (i + 1 < max_tokens) {
+      next = sequence.Advance(next);
+    }
+  }
+  result.forward_tokens = sequence.pos();
+  return result;
+}
+
+void RunChat(const Args& args, const llama2::Vocab& vocab,
+             const Forward& forward) {
+  Sequence sequence(forward);
+  std::string system_prompt = args.system_prompt;
+  bool first_turn = true;
+
+  if (!args.has_system_prompt) {
+    std::cout << "Enter system prompt (optional): " << std::flush;
+    if (!std::getline(std::cin, system_prompt)) {
+      return;
+    }
+  }
+
+  while (sequence.pos() < static_cast<int>(args.max_seq)) {
+    std::string user_prompt;
+    if (first_turn && !args.prompt.empty()) {
+      user_prompt = args.prompt;
+    } else {
+      std::cout << "User: " << std::flush;
+      if (!std::getline(std::cin, user_prompt)) {
+        break;
+      }
+    }
+
+    std::ostringstream rendered;
+    if (first_turn && !system_prompt.empty()) {
+      rendered << "[INST] <<SYS>>\n"
+               << system_prompt << "\n<</SYS>>\n\n"
+               << user_prompt << " [/INST]";
+    } else {
+      rendered << "[INST] " << user_prompt << " [/INST]";
+    }
+    first_turn = false;
+
+    const std::vector<int> prompt_tokens =
+        llama2::Encode(vocab, rendered.str(), true, false);
+    if (sequence.pos() + static_cast<int>(prompt_tokens.size()) >
+        static_cast<int>(args.max_seq)) {
+      std::cout << "Context is full.\n";
+      break;
+    }
+
+    std::cout << "Assistant: " << std::flush;
+    int next = 0;
+    for (const int token : prompt_tokens) {
+      next = sequence.Advance(token);
+    }
+
+    int previous = prompt_tokens.back();
+    while (next != 2) {
+      const std::string piece = llama2::DecodePiece(vocab, previous, next);
+      std::cout.write(piece.data(), piece.size());
+      std::cout << std::flush;
+      previous = next;
+      if (sequence.pos() >= static_cast<int>(args.max_seq)) {
+        break;
+      }
+      next = sequence.Advance(next);
+    }
+    std::cout << "\n";
+
+    if (next == 2 && sequence.pos() < static_cast<int>(args.max_seq)) {
+      (void)sequence.Advance(next);
+    }
+  }
+}
+
+#ifndef USE_CPU_ONLY
+using Json = nlohmann::json;
+
+void SetJson(httplib::Response& response, const Json& body,
+             int status = 200) {
+  response.status = status;
+  response.set_content(body.dump(), "application/json");
+}
+
+Json ErrorJson(int code, std::string_view message,
+               std::string_view type = "invalid_request_error") {
+  return {{"error", {{"code", code}, {"message", message}, {"type", type}}}};
+}
+
+void RunServer(const Args& args, const llama2::Vocab& vocab,
+               const Forward& forward) {
+  httplib::Server server;
+  server.new_task_queue = [] { return new httplib::ThreadPool(1); };
+  uint64_t completion_id = 0;
+
+  server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    SetJson(res, {{"status", "ok"}});
+  });
+
+  server.Get("/v1/models",
+             [](const httplib::Request&, httplib::Response& res) {
+               SetJson(res,
+                       {{"object", "list"},
+                        {"data",
+                         {{{"id", kModelId},
+                           {"object", "model"},
+                           {"owned_by", "llama2.hls"},
+                           {"meta",
+                            {{"backend", "XRT"},
+                             {"device", "KV260"},
+                             {"context_length", llama2::kSeqLen},
+                             {"temperature", 0}}}}}}});
+             });
+
+  server.Post("/v1/completions",
+              [&](const httplib::Request& request, httplib::Response& res) {
+                try {
+                  const Json input = Json::parse(request.body);
+                  if (!input.is_object()) {
+                    throw std::invalid_argument("request body must be an object");
+                  }
+                  if (!input.contains("model") ||
+                      !input.at("model").is_string() ||
+                      input.at("model").get<std::string>() != kModelId) {
+                    throw std::invalid_argument("unknown model");
+                  }
+                  if (!input.contains("prompt") ||
+                      !input.at("prompt").is_string()) {
+                    throw std::invalid_argument("prompt must be a string");
+                  }
+                  if (input.value("stream", false)) {
+                    throw std::invalid_argument(
+                        "streaming is not supported in this version");
+                  }
+                  const double temperature = input.value("temperature", 0.0);
+                  if (temperature != 0.0) {
+                    throw std::invalid_argument("temperature must be 0");
+                  }
+                  const int max_tokens = input.value("max_tokens", 32);
+                  const CompletionResult result = Complete(
+                      vocab, input.at("prompt").get<std::string>(), max_tokens,
+                      forward);
+
+                  SetJson(
+                      res,
+                      {{"id", "cmpl-kv260-" +
+                                  std::to_string(++completion_id)},
+                       {"object", "text_completion"},
+                       {"model", kModelId},
+                       {"choices",
+                        {{{"text", result.text},
+                          {"index", 0},
+                          {"logprobs", nullptr},
+                          {"finish_reason",
+                           result.stopped ? "stop" : "length"}}}},
+                       {"usage",
+                        {{"prompt_tokens", result.prompt_tokens},
+                         {"completion_tokens", result.completion_tokens},
+                         {"total_tokens", result.prompt_tokens +
+                                              result.completion_tokens}}}});
+                } catch (const nlohmann::json::exception& error) {
+                  SetJson(res, ErrorJson(400, error.what()), 400);
+                } catch (const std::exception& error) {
+                  SetJson(res, ErrorJson(400, error.what()), 400);
+                }
+              });
+
+  std::cout << "Listening on http://" << args.host << ':' << args.port
+            << std::endl;
+  if (!server.listen(args.host, args.port)) {
+    throw std::runtime_error("failed to start HTTP server");
+  }
+}
+#endif // USE_CPU_ONLY
 
 // Random Sampling
 int SelectFromLogits(const llama2::Tensor1dLogits& prob_dist) {
@@ -198,8 +474,14 @@ int main(int argc, char* argv[]) {
               << "Options:" << std::endl
               << "  --weight_path   : Weight file path" << std::endl
               << "  --vocab_path    : Tokenizer file path" << std::endl
+              << "  -m, --mode      : generate|chat|server" << std::endl
+              << "  -i, --prompt    : Input prompt in generate mode" << std::endl
+              << "  -y, --system_prompt: Initial system prompt in chat mode"
+              << std::endl
               << "  --max_seq       : Maximum sequence length" << std::endl
               << "  --temp          : Temperature for sampling" << std::endl
+              << "  --host          : Server bind address" << std::endl
+              << "  --port          : Server port" << std::endl
               << "  --color         : Enable color output" << std::endl
               << "  --log           : Enable log output" << std::endl
               << "  --help, -h      : Show this help message" << std::endl;
@@ -210,7 +492,22 @@ int main(int argc, char* argv[]) {
               << llama2::kSeqLen << std::endl;
     return EXIT_FAILURE;
   }
-  const int max_seq = static_cast<int>(args.max_seq);
+  if (args.mode != "generate" && args.mode != "chat" &&
+      args.mode != "server") {
+    std::cerr << "[ERROR] Unknown mode: " << args.mode << std::endl;
+    return EXIT_FAILURE;
+  }
+  if (args.port <= 0 || args.port > 65535) {
+    std::cerr << "[ERROR] --port must be in [1, 65535]" << std::endl;
+    return EXIT_FAILURE;
+  }
+#ifdef USE_CPU_ONLY
+  if (args.mode == "server") {
+    std::cerr << "[ERROR] server mode is only available in the FPGA host build"
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+#endif
 
   // 2. Print hyper parameters.
   std::cout << "Hyper Parameters" << std::endl
@@ -429,11 +726,6 @@ int main(int argc, char* argv[]) {
   llama2::Tensor1dLogits ctx_logits;
   llama2::Tensor1d ctx_final_norm;
 
-  auto start_clk = std::chrono::steady_clock::now();
-
-  int next;
-  int token = 1; // BOS (Begin of Sequence)
-
 #ifndef USE_CPU_ONLY
   if (args.temp >= 1e-5) {
     std::cerr << "[ERROR] FPGA build returns exact argmax token only; use "
@@ -443,20 +735,18 @@ int main(int argc, char* argv[]) {
   }
 #endif // USE_CPU_ONLY
 
-  for (int pos = 0; pos < max_seq; ++pos) {
-
-    // 6-1. Load the context input and decode the next token.
+  const Forward forward = [&](int token, int pos) {
+    int next = 0;
     llama2::CopyTensor1d(ctx_input, tok_emb_table[token]);
     llama2::Decode(token, pos, ctx_input, ctx_k_cache, ctx_v_cache,
-                 ctx_final_norm, ctx_logits, next, weights
+                   ctx_final_norm, ctx_logits, next, weights
 #ifndef USE_CPU_ONLY
-                 ,
-                 q, decode_kernel, next_host.data(), buffer_next
+                   ,
+                   q, decode_kernel, next_host.data(), buffer_next
 #endif // USE_CPU_ONLY
     );
 
 #ifdef USE_CPU_ONLY
-    // 6-2. Calculate the logits and softmax.
     llama2::MutmulVocab(ctx_logits, ctx_final_norm, weights.tok_emb_q,
                         weights.tok_emb_s);
 #endif // USE_CPU_ONLY
@@ -475,7 +765,6 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    // 6-3. Sampling the next token.
 #ifdef USE_CPU_ONLY
     if (args.temp < 1e-5) {
       next = llama2::Argmax(ctx_logits);
@@ -488,17 +777,6 @@ int main(int argc, char* argv[]) {
     }
 #endif // USE_CPU_ONLY
 
-    const std::string piece = llama2::DecodePiece(vocab, token, next);
-    if (args.color) {
-      std::cout << "\e[31m";
-      std::cout.write(piece.data(), piece.size());
-      std::cout << "\e[0m";
-    } else {
-      std::cout.write(piece.data(), piece.size());
-    }
-    std::cout << std::flush;
-
-    // Dump the contexts.
     if (args.log) {
 #ifdef USE_CPU_ONLY
       DumpContext("log/" + std::to_string(pos) + "_", ctx, llama2::kNumLayers);
@@ -506,21 +784,49 @@ int main(int argc, char* argv[]) {
       std::cerr << "--log is only available in CPU-only builds.\n";
 #endif
     }
+    return next;
+  };
 
-    token = next;
+  if (args.mode == "chat") {
+    RunChat(args, vocab, forward);
+  } else if (args.mode == "server") {
+#ifndef USE_CPU_ONLY
+    RunServer(args, vocab, forward);
+#endif
+  } else {
+    const std::vector<int> prompt_tokens =
+        llama2::Encode(vocab, args.prompt, true, false);
+    const int max_tokens = static_cast<int>(args.max_seq) -
+                           static_cast<int>(prompt_tokens.size()) + 1;
+    if (max_tokens <= 0) {
+      std::cerr << "[ERROR] prompt exceeds --max_seq" << std::endl;
+      return EXIT_FAILURE;
+    }
+
+    const auto start_clk = std::chrono::steady_clock::now();
+    const auto print_piece = [&](std::string_view piece) {
+      if (args.color) {
+        std::cout << "\e[31m";
+        std::cout.write(piece.data(), piece.size());
+        std::cout << "\e[0m";
+      } else {
+        std::cout.write(piece.data(), piece.size());
+      }
+      std::cout << std::flush;
+    };
+    const CompletionResult result =
+        Complete(vocab, args.prompt, max_tokens, forward, print_piece);
+    std::cout << "\n";
+
+    const auto end_clk = std::chrono::steady_clock::now();
+    const double decode_time =
+        std::chrono::duration<double>(end_clk - start_clk).count();
+    std::cout << "Time : " << decode_time << "[s]" << std::endl
+              << "Speed: " << result.forward_tokens / decode_time << "[tok/s]"
+              << std::endl;
   }
-  std::cout << "\n";
-
-  // 7. Print the time and speed.
-  auto end_clk = std::chrono::steady_clock::now();
-  double decode_time =
-      std::chrono::duration<double>(end_clk - start_clk).count();
-  std::cout << "Time : " << decode_time << "[s]" << std::endl
-            << "Speed: " << args.max_seq / decode_time << "[tok/s]"
-            << std::endl;
 
 #ifndef USE_CPU_ONLY
-  // 8. Flush OpenCL commands.
   OCL_CHECK(err, err = q.finish());
   delete[] buf;
   std::cout.flush();
