@@ -255,7 +255,7 @@ CompletionResult Complete(const llama2::Vocab& vocab, std::string_view prompt,
   result.prompt_tokens = static_cast<int>(prompt_tokens.size());
   int previous = prompt_tokens.back();
   for (int i = 0; i < max_tokens; ++i) {
-    if (next == 1) {
+    if (next == 1 || next == 2) {
       result.stopped = true;
       break;
     }
@@ -361,7 +361,17 @@ void RunServer(const Args& args, const llama2::Vocab& vocab,
                const Forward& forward) {
   httplib::Server server;
   server.new_task_queue = [] { return new httplib::ThreadPool(1); };
+  server.set_default_headers({{"Access-Control-Allow-Origin", "*"},
+                              {"Access-Control-Allow-Headers",
+                               "Content-Type, Ngrok-Skip-Browser-Warning"},
+                              {"Access-Control-Allow-Methods",
+                               "GET, POST, OPTIONS"}});
   uint64_t completion_id = 0;
+
+  server.Options(R"(/.*)",
+                 [](const httplib::Request&, httplib::Response& res) {
+                   res.status = 204;
+                 });
 
   server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
     SetJson(res, {{"status", "ok"}});
@@ -406,7 +416,7 @@ void RunServer(const Args& args, const llama2::Vocab& vocab,
                   if (temperature != 0.0) {
                     throw std::invalid_argument("temperature must be 0");
                   }
-                  const int max_tokens = input.value("max_tokens", 32);
+                  const int max_tokens = input.value("max_tokens", 64);
                   const CompletionResult result = Complete(
                       vocab, input.at("prompt").get<std::string>(), max_tokens,
                       forward);

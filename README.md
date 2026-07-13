@@ -18,6 +18,11 @@ Karpathy [tinyllama stories15M](https://huggingface.co/karpathy/tinyllamas) 在 
 │   ├── main.cpp            # generate / chat / HTTP server host 入口
 │   ├── decode.cpp / .hpp   # HLS top + host 推理逻辑
 │   └── …
+├── docs/                   # GitHub Pages 单页前端
+│   ├── index.html
+│   ├── app.js
+│   ├── style.css
+│   └── .nojekyll
 └── outputs/                # 本地构建产物（git ignore）
     ├── hls/ link/ host/ bundle/ logs/
 ```
@@ -290,7 +295,7 @@ curl http://127.0.0.1:8080/v1/completions \
   -d '{
     "model": "tinystories-15m-w8a8-kv260",
     "prompt": "Once upon a time",
-    "max_tokens": 32,
+    "max_tokens": 64,
     "temperature": 0,
     "stream": false
   }'
@@ -298,7 +303,37 @@ curl http://127.0.0.1:8080/v1/completions \
 
 `GET /health`在服务可用时返回HTTP 200和`{"status":"ok"}`。
 `POST /v1/completions`返回llama.cpp/OpenAI-compatible的
-`text_completion` JSON；当前不支持streaming或非零temperature。
+`text_completion` JSON；当前不支持streaming或非零temperature。省略
+`max_tokens`时默认上限为64；遇到BOS或EOS会提前结束。
+
+## GitHub Pages
+
+`docs/`是无构建步骤的静态单页前端。页面只显示KV260状态、模型输出和
+prompt输入框；固定使用`tinystories-15m-w8a8-kv260`、64-token上限、
+greedy argmax和非流式completion。
+
+在KV260运行server后，用ngrok将本地8080端口公开为HTTPS：
+
+```bash
+ngrok http 8080
+```
+
+当前前端使用KV260 ngrok地址：
+
+```html
+<meta name="llama2-api-base"
+      content="https://unsacrilegious-abstractive-werner.ngrok-free.dev">
+```
+
+最后在GitHub仓库的Settings -> Pages中选择`Deploy from a branch`，发布
+`Q8`分支的`/docs`目录。页面地址为：
+
+```text
+https://ruhai-lin.github.io/llama2.hls/
+```
+
+页面加载时只请求`GET /health`。Board、server或ngrok未运行时，页面显示
+`KV260 is resting`并禁用输入。
 
 当前single-kernel W8A8结构在150 MHz下的板上结果如下。`temp=0`时，
 16-token输出为`Once upon a time, there was a little girl named Lily. She loved`，
