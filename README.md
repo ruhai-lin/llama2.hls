@@ -47,23 +47,37 @@ decode
 
 Linear层采用与 `references/llama2.c/runq.c` 对齐的 Q8_0 W8A8 语义：权重按 `group_size=32` 存储为 INT8 + FP32 scale，activation在linear边界动态量化，32-lane INT8 dot使用INT32累加，再按group scale恢复为FP32输出。Attention RMSNorm后的量化结果由Q/K/V共享，FFN RMSNorm后的量化结果由W1/W3共享。
 
-所有linear顺序复用同一个非模板化`q8_gemv_engine()`。engine一次只处理16个
-输出行，接口只有packed matrix word offset、group count、量化activation、activation
-scales和16个score；它不知道当前矩阵属于Q/K/V/O、W1/W3/W2还是LM head。
-外层`q8_linear()` controller根据矩阵行数循环调用engine。RMSNorm、RoPE、
-softmax、residual和KV cache继续使用FP32。CPU reference和FPGA都按
-`head_dim = kDim / kNumHeads`执行attention，RoPE只遍历`head_dim / 2`个pair。
+所有linear顺序复用同一个非模板化`q8_gemv_engine()`。物理datapath一次处理
+16个输出行，只从片上parameter tile读取weight/scale；engine按16-row block
+遍历当前tile，并用两组accumulator context交替接收下一个block和归约上一个
+block。它不知道当前矩阵属于Q/K/V/O、W1/W3/W2还是LM head。外层
+`q8_linear()` controller按64个输出行遍历矩阵：先将第一个tile装入URAM，
+随后由唯一的非inline `q8_gemv_tile()`在同一个dataflow step中用连续128-bit
+burst装载下一个tile，同时顺序计算当前tile。M5.1在当前矩阵最后一个tile计算时
+直接预取下一矩阵的第一个tile，Q/K/V/O、W1/W3/W2、下一层Q和LM head之间不再
+重复执行独立的首次填充。唯一一组ping/pong URAM在`decode`顶层显式实例化。
+
+RMSNorm、RoPE、attention、residual和KV cache继续使用FP32。CPU reference和FPGA
+都按`head_dim = kDim / kNumHeads`执行attention，RoPE只遍历`head_dim / 2`
+个pair；每个token只从DDR加载一次该position的24组sin/cos，后续layer复用
+RoPE内部buffer。K/V cache统一为`[layer][position][dim]`，每次按128 bit连续
+读写完整position。Attention按position依次读取K和V，用online softmax同步更新
+每个head的running max、归一化和weighted value，不再物化QK/softmax中间数组，
+也不再对V cache执行跨position的窄步长读取。
 
 LM head 不走通用 writeback 路径，专门在 `lm_head` 中流式扫描 embedding rows 并维护 argmax：
 
 ```text
 final_q = quantize(final_norm)
-for block in 0..1999:
-  scores[16] = q8_gemv_engine(tok_emb_q[block], final_q)
+for tile in embedding_rows:
+  scores[64] = q8_gemv_tile(tile, final_q)
   best = max(best, scores)
 ```
 
-`final_norm[288]` 在LM head开始时只量化一次。该实现保留Q8模型的exact argmax；输入token embedding在host加载checkpoint时反量化为FP32，LM head则直接扫描Q8 embedding权重。
+`final_norm[288]` 在LM head开始时只量化一次。LM head仍每获得16个
+score就立即更新argmax，不保存32K logits。该实现保留Q8模型的exact
+argmax；输入token embedding在host加载checkpoint时反量化为FP32，LM head
+则直接扫描Q8 embedding权重。
 
 ## 前置环境
 
@@ -111,6 +125,7 @@ package.output.syn=1
 syn.top=decode
 syn.file=<仓库根>/src/decode.cpp
 syn.cflags=-DBUILD_DECODE_KERNEL
+syn.interface.m_axi_max_widen_bitwidth=128
 clock=150MHz
 ```
 
@@ -335,15 +350,16 @@ https://ruhai-lin.github.io/llama2.hls/
 页面加载时只请求`GET /health`。Board、server或ngrok未运行时，页面显示
 `KV260 is resting`并禁用输入。
 
-当前single-kernel W8A8结构在150 MHz下的板上结果如下。`temp=0`时，
+下表对比M2、M3、M5和当前M5.1，均为KV260单HP0、150 MHz实测。M5和M5.1
+每个长度运行3次并报告中位数；M3的1-token结果包含明显启动抖动。`temp=0`时，
 16-token输出为`Once upon a time, there was a little girl named Lily. She loved`，
 与CPU实现和`references/llama2.c/runq.c`一致。
 
-| Command | Time | Speed |
-|---|---:|---:|
-| `./llama2_host --max_seq 1 --temp 0` | 0.0162073 s | 61.7007 tok/s |
-| `./llama2_host --max_seq 16 --temp 0` | 0.272190 s | 58.7825 tok/s |
-| `./llama2_host --max_seq 64 --temp 0` | 1.81511 s | 35.2596 tok/s |
+| Tokens | M2 speed | M3 speed | M5 speed | M5.1 median time | M5.1 speed | M5 -> M5.1 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 76.6195 tok/s | 54.0920 tok/s | 78.2472 tok/s | 0.011243 s | 88.9455 tok/s | +13.7% |
+| 16 | 73.9004 tok/s | 73.8540 tok/s | 93.5924 tok/s | 0.141770 s | 112.859 tok/s | +20.6% |
+| 64 | 42.1067 tok/s | 42.0031 tok/s | 80.4145 tok/s | 0.583109 s | 109.756 tok/s | +36.5% |
 
 测完后可恢复默认 starter app：
 
@@ -354,40 +370,55 @@ sudo xmutil loadapp k26-starter-kits
 
 ## PPA 与瓶颈
 
-本节数据来自当前单kernel W8A8源码的Vitis HLS 2025.2综合、150 MHz
-routed implementation和KV260实测。
+本节的资源、时序与层级数据来自当前M5.1源码的Vitis HLS 2025.2综合和
+150 MHz routed implementation。
 
 ### 资源与时序
 
 | Scope | LUT | FF/REG | BRAM | URAM | DSP |
 |---|---:|---:|---:|---:|---:|
-| Single-engine W8A8 HLS estimate | 59,653 (50%) | 40,008 (17%) | 59 BRAM18K (20%) | 8 (12%) | 105 (8%) |
-| Single-engine W8A8 routed kernel | 31,377 (28.16% user budget) | 39,465 (17.35%) | 22 tiles (15.28%) | 8 (12.50%) | 105 (8.41%) |
+| M5.1 single-engine HLS estimate | 62,297 (53%) | 64,508 (27%) | 72 BRAM18K (25%) | 16 (25%) | 148 (11%) |
+| M5.1 linked kernel synthesis | 55,532 (47.41%) | 57,394 (24.50%) | 25.5 tiles (17.71%) | 16 (25%) | 162 (12.98%) |
 
-150 MHz目标下HLS estimated period为`6.727 ns`，比`6.667 ns`目标多
-`0.060 ns`；实际routed WNS为`+0.441 ns`，WHS为`+0.010 ns`，
-所有用户时序约束满足。
+HLS对quantize中的局部组合路径给出6.727 ns的保守估算；150 MHz完整物理实现
+的实际routed WNS为`+0.341 ns`，WHS为`+0.010 ns`，所有用户时序约束满足。
 
 ### HLS Cycle Bottleneck
 
 | Module | HLS latency |
 |---|---:|
-| Shared `q8_gemv_engine` | 119-666 cycles/call |
+| Shared `q8_gemv_tile` | 4,172 cycles/call |
+| Dataflow `q8_gemv_step` | 4,171 cycles/call |
+| Parameter tile load | 4,171 cycles/call |
+| Current tile compute | 1,241 cycles/call |
+| Shared `q8_gemv_engine` | 1,240 cycles/call |
 | quantize 288 | 937 cycles |
 | quantize 768 | 2,497 cycles |
 
-HLS hierarchy和routed hierarchy中都只有一个`q8_gemv_engine`。该实例内部只有
-一套packed load pipeline、一套group dot/reduction pipeline和一套score reduction
-pipeline；routed cell中有32个INT8 `mac_muladd`和32个INT8 `mul`，构成2x32-lane
-datapath，8个URAM全部属于同一个`block_words` buffer。
+HLS hierarchy和routed netlist中都只有一个`q8_gemv_tile`、一个
+`q8_gemv_step`、一个loader、一个compute controller和一个
+`q8_gemv_engine`。该tile内只有一套2x32-lane INT8 MAC、两组交替使用的
+accumulator context和一套reduction/dequant/FP32 accumulation datapath。
+routed timing hierarchy也只出现一个engine实例。
 
-当前实现是功能正确的单engine W8A8基线，第一瓶颈仍是LM head。Q/K/V共享一次activation
+片上parameter storage固定为`ping/pong x 4 banks x 864 words x 128 bit`。HLS推导出
+8个独立URAM bank，每个bank深度864、宽度128 bit并占用2个URAM，总计16个URAM。
+controller先填充ping；稳态下loader写入空闲tile的同时，唯一的engine从另一个tile
+计算最多64个输出行，然后交换ping/pong。HLS dataflow报告中full-tile load
+为4,171 cycles、compute为1,241 cycles，step仍为4,171 cycles，证明
+两者已重叠且当前稳态关键路径是参数装载。M5.1进一步用当前矩阵最后一次compute
+覆盖下一矩阵的首次tile load，消除了43次linear调用之间的42个参数断层。
+
+当前实现是功能正确的单engine W8A8 M5.1 checkpoint，第一瓶颈仍是LM head。
+Q/K/V共享一次activation
 quantization，W1/W3也共享一次；各矩阵的weight scale本身不同，不能跨矩阵共享。
 checkpoint仍保持llama2.c的split Q8格式。host加载后将全部Q8 weight和scale一次
 pack成17,086,464-byte FPGA参数blob；每16 rows按group-major排列，一个group由
-1个scale word和8个双row weight word组成，不包含padding。kernel以81/216个
-512-bit word为单位加载到URAM block buffer，再执行INT8 dot和8-stage浮点归约。
-本轮优先确认功能和物理单实例，尚未加入跨block的group-major流水和ping-pong。
+1个512-bit scale word和8个512-bit双row weight word组成，不包含padding。host的
+canonical blob布局不变，kernel端将每个512-bit word拆成4个连续128-bit beat。
+64-row tile对应324个512-bit word/1,296个128-bit beat（`group_count=9`），或864个
+512-bit word/3,456个128-bit beat（`group_count=24`）。装载后再执行INT8 dot和8-stage
+浮点归约。
 
 ### 带宽
 
@@ -395,17 +426,26 @@ HLS interface 报告显示：
 
 | Port group | Width | Burst |
 |---|---:|---|
-| `m_axi_gmem` | `32 -> 512` bit | max read burst 256, max write burst 16 |
+| `m_axi_gmem` | 128 bit | max read burst 256, read outstanding 16 |
 
 kernel只有一个AXI master；Link cfgen将`m_axi_gmem`映射到KV260 base platform的
-`HP0` path。以150 MHz计算，512-bit HLS数据端口的理想接口上限是
-`512/8*150MHz = 9.6 GB/s`，但实际还受HP0、DDR控制器、burst质量和kernel
-launch开销影响。
+`S_AXI_HP0_FPD` path。HLS `kernel.xml`和link后的xclbin metadata都显示唯一
+`M_AXI_GMEM` data width为128 bit，与HP0物理数据宽度一致。以150 MHz计算，
+理想接口上限是`128/8*150MHz = 2.4 GB/s`，实际还受DDR控制器、burst质量和
+kernel launch开销影响。
 
-每个group包含32个INT8 weight和一个FP32 scale。packed参数已经是512-bit类型，
-HLS报告中的`Widen Fail`表示它等于512-bit max-widen阈值，无需继续widen；连续
-访问已推断为512-bit burst。KV cache跨head/position访问和RoPE表仍有stride或
-widen限制，它们是position增长时吞吐下降的下一组优化对象。
+每个group包含32个INT8 weight和一个FP32 scale。packed parameter loader的连续
+访问已推断为可变长128-bit burst；`m_axi_max_widen_bitwidth=128`防止HLS将该
+单流接口再自动拓宽。生成RTL的AXI adapter固定输出INCR burst，并将长tile
+请求拆成最多256 beats。M5将全局read outstanding从2提高到16，AXI adapter
+的HLS资源估算由8增至30 BRAM18K；64-row targeted RTL测试从M3的11,110
+cycles降至9,334 cycles，减少16.0%。
+
+按每个token扫描17,086,464-byte packed参数计算，M5.1端到端实测对应的有效参数
+带宽分别为1-token `1.520 GB/s`、16-token `1.928 GB/s`、64-token
+`1.875 GB/s`。position-major online attention消除了原先64-token时明显的
+sequence-length退化；16和64-token均越过100 tok/s阶段目标，并已接近单HP0在
+该访问模式下的实际带宽上限。
 
 ## 参考资料
 
