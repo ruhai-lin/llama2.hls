@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#0b0c0d">
-    <meta name="description" content="TinyStories-15M running on a KV260 FPGA">
+    <meta name="description" content="ClimbMix-15M SFT running on a KV260 FPGA">
     <meta name="llama2-api-base"
           content="https://unsacrilegious-abstractive-werner.ngrok-free.dev">
     <title>llama2.hls</title>
@@ -24,18 +24,18 @@
         <section id="output-panel" class="output-panel" aria-live="polite">
           <div id="welcome" class="welcome">
             <h1>llama2.hls</h1>
-            <p>TinyStories-15M running on a KV260 FPGA</p>
+            <p>ClimbMix-15M SFT running on a KV260 FPGA</p>
           </div>
           <div id="completion" class="completion" hidden></div>
           <p id="metrics" class="metrics" hidden></p>
         </section>
       </main>
 
-      <form id="prompt-form" class="composer" aria-label="Story prompt">
+      <form id="prompt-form" class="composer" aria-label="Chat prompt">
         <div class="composer-inner">
-          <label class="sr-only" for="prompt">Story prompt</label>
+          <label class="sr-only" for="prompt">Chat prompt</label>
           <textarea id="prompt" name="prompt" rows="1"
-                    placeholder="Start a story..." autocomplete="off"
+                    placeholder="Ask something..." autocomplete="off"
                     disabled></textarea>
           <button id="send" type="submit" aria-label="Send" title="Send" disabled>
             <span aria-hidden="true">&uarr;</span>

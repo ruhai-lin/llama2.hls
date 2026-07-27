@@ -1,6 +1,6 @@
 "use strict";
 
-const MODEL_ID = "tinystories-15m-w8a8-kv260";
+const MODEL_ID = "climbmix-15m-sft-v2-w8a8-kv260";
 const MAX_TOKENS = 64;
 const NGROK_HEADERS = {"ngrok-skip-browser-warning": "1"};
 const API_BASE = document
@@ -78,7 +78,7 @@ async function generate(prompt) {
       },
       body: JSON.stringify({
         model: MODEL_ID,
-        prompt,
+        prompt: `[INST] ${prompt} [/INST]`,
         max_tokens: MAX_TOKENS,
         temperature: 0,
         stream: false,
